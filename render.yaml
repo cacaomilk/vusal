@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: vusal
+    runtime: node
+    plan: free
+    buildCommand: "npm install && node unpack-assets.js"
+    startCommand: "npm start"
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 10000
