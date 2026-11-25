@@ -1,0 +1,713 @@
+/* VUSAL — browser UI. Pass & play runs the engine locally; online rooms talk to server.js. */
+(function () {
+  'use strict';
+  var E = window.VusalEngine, C = E.CARDS;
+  function $(s) { return document.querySelector(s); }
+  function $$(s) { return Array.prototype.slice.call(document.querySelectorAll(s)); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function img(id) { return C[id] ? C[id].img : ''; }
+
+  var ui = {
+    screen: 'setup', mode: 'menu', localState: null, privacySeat: null,
+    confirmCard: null, localPlayers: 2, onlinePlayers: 4,
+    cardFilter: 'All', cardQuery: '', light: false, noPrivacy: false, toastTimer: null
+  };
+  var online = { code: '', seat: 0, token: '', version: 0, state: null };
+  var pollGeneration = 0;
+  var rendering = false;
+
+  /* ---------------- jazz (optional) ---------------- */
+  var actx = null, jazzOn = false, jazzTimer = null, jazzStep = 0;
+  var PROG = [
+    [146.83, 174.61, 220.00, 261.63],
+    [98.00, 123.47, 146.83, 174.61],
+    [130.81, 164.81, 196.00, 246.94],
+    [110.00, 138.59, 164.81, 196.00]
+  ];
+  function note(freq, dur, type, vol, delay) {
+    var t0 = actx.currentTime + (delay || 0);
+    var o = actx.createOscillator(), g = actx.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(0, t0);
+    g.gain.linearRampToValueAtTime(vol, t0 + 0.06);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t0); o.stop(t0 + dur + 0.05);
+  }
+  function chord() {
+    if (!actx) return;
+    var f = PROG[jazzStep++ % PROG.length];
+    f.forEach(function (x, i) { note(x, 2.1, i === 0 ? 'triangle' : 'sine', i === 0 ? 0.028 : 0.017, i * 0.035); });
+    note(f[0] * 4, 0.5, 'sine', 0.008, 0.9);
+    note(f[2] * 4, 0.5, 'sine', 0.006, 1.35);
+  }
+  function toggleJazz(forceOn) {
+    var want = forceOn === true ? true : !jazzOn;
+    if (want === jazzOn) { if (want) chord(); return; }
+    jazzOn = want;
+    if (jazzOn) {
+      if (!actx) { var AC = window.AudioContext || window.webkitAudioContext; if (!AC) { toast('NO AUDIO SUPPORT'); jazzOn = false; return; } actx = new AC(); }
+      if (actx.state === 'suspended') actx.resume();
+      chord();
+      jazzTimer = setInterval(chord, 2500);
+    } else { clearInterval(jazzTimer); jazzTimer = null; }
+    $('#jazzBtn').style.textDecoration = jazzOn ? 'underline' : 'none';
+    toast(jazzOn ? 'JAZZ ON' : 'JAZZ OFF');
+  }
+  function savePrefs() {
+    try {
+      localStorage.setItem('vusal.light', ui.light ? '1' : '0');
+      localStorage.setItem('vusal.noPrivacy', ui.noPrivacy ? '1' : '0');
+    } catch (e) {}
+  }
+  function toast(msg) {
+    var t = $('#toast'); t.textContent = msg; t.hidden = false;
+    clearTimeout(ui.toastTimer);
+    ui.toastTimer = setTimeout(function () { t.hidden = true; }, 1900);
+  }
+
+  /* ---------------- navigation ---------------- */
+  function go(screen) {
+    if (screen === 'game' && ui.mode === 'menu') screen = 'setup';
+    ui.screen = screen;
+    render();
+  }
+  function render() {
+    if (rendering) return;
+    rendering = true;
+    try {
+      if (ui.mode === 'online' && online.state && online.state.phase !== 'lobby' && ui.screen === 'setup') ui.screen = 'game';
+      $$('.screen').forEach(function (s) { s.classList.toggle('active', s.id === 'screen-' + ui.screen); });
+      $$('.nav-btn').forEach(function (b) { b.classList.toggle('on', b.dataset.screen === ui.screen); });
+      // Never let a game overlay (privacy, reveal, prompt, game over) linger over another screen.
+      if (ui.screen !== 'game') {
+        var ov = $('#overlay');
+        ov.hidden = true; ov.innerHTML = '';
+        ov.classList.remove('passive', 'privacy-screen');
+        ui.confirmCard = null;
+        $('#mobileBar').hidden = true;
+      }
+      $('#modeBadge').textContent = ui.mode === 'local' ? 'PASS & PLAY' : ui.mode === 'online' ? 'ROOM ' + online.code + ' · SEAT ' + (online.seat + 1) : 'NO GAME';
+      if (ui.screen === 'setup') renderMenu();
+      if (ui.screen === 'game') renderGame();
+      if (ui.screen === 'cards') renderCards();
+    } finally { rendering = false; }
+  }
+
+  /* ---------------- menu ---------------- */
+  function renderNames() {
+    var box = $('#localNames');
+    var html = '';
+    for (var i = 0; i < ui.localPlayers; i++) {
+      html += '<label class="field">PLAYER ' + (i + 1) + '<input class="localName" data-i="' + i + '" maxlength="24" placeholder="Player ' + (i + 1) + '"></label>';
+    }
+    box.innerHTML = html;
+  }
+  function renderMenu() {
+    var saved = null;
+    try { saved = localStorage.getItem('vusal.local'); } catch (e) {}
+    $('#resumeLocal').hidden = !saved;
+    if (ui.mode === 'online') renderRoomCard();
+  }
+  function selectedPlayers(sel) {
+    var b = $(sel + ' button.on');
+    return b ? Number(b.dataset.n) : 2;
+  }
+  function startLocal(resume) {
+    if (resume) {
+      try {
+        var raw = localStorage.getItem('vusal.local');
+        if (!raw) return;
+        ui.localState = JSON.parse(raw);
+        ui.localState.history = [];
+      } catch (e) { toast('SAVED GAME UNREADABLE'); return; }
+    } else {
+      var names = $$('.localName').map(function (i) { return i.value.trim(); });
+      var cfg = {
+        players: ui.localPlayers, names: names,
+        manualDice: $('#optManual').checked, exactFinish: $('#optExact').checked,
+        sequenceWin: $('#optSequence').checked, showMarkers: $('#optMarkers').checked
+      };
+      ui.noPrivacy = $('#optPrivacy').checked;
+      savePrefs();
+      ui.localState = E.newGame(cfg);
+      E.apply(ui.localState, { type: 'START' });
+    }
+    ui.mode = 'local';
+    ui.privacySeat = ui.noPrivacy ? focusSeat() : null;
+    ui.confirmCard = null;
+    saveLocal();
+    go('game');
+  }
+  function saveLocal() {
+    if (!ui.localState) return;
+    try {
+      var s = JSON.parse(JSON.stringify(ui.localState));
+      delete s.history;
+      localStorage.setItem('vusal.local', JSON.stringify(s));
+    } catch (e) {}
+  }
+
+  /* ---------------- online rooms ---------------- */
+  function renderRoomCard() {
+    if (!online.state) return;
+    $('#onlineForms').hidden = true;
+    $('#roomCard').hidden = false;
+    $('#roomCodeText').textContent = online.code;
+    var v = online.state;
+    var you = v.players[online.seat];
+    $('#roomSeatLine').textContent = 'You are seat ' + (online.seat + 1) + ' (' + esc(you ? you.name : '') + '). Share the game link or the room code.';
+    var rl = $('#roomLinkText');
+    if (rl) { rl.hidden = !isHosted(); rl.textContent = isHosted() ? linkFor(online.code) : ''; }
+    var taken = v.takenSeats || [];
+    var seatsFull = v.players.every(function (p) { return taken.indexOf(p.i) >= 0; });
+    $('#roomSeats').innerHTML = v.players.map(function (p) {
+      var tag = p.i === online.seat ? 'YOU' : (p.i === 0 ? 'HOST' : (taken.indexOf(p.i) >= 0 ? 'JOINED' : 'OPEN'));
+      return '<li><b>' + (p.i + 1) + '</b><span>' + esc(p.name) + '</span><em>' + tag + '</em></li>';
+    }).join('');
+    $('#startOnline').hidden = online.seat !== 0 || !seatsFull;
+  }
+  function isHosted() { return /^https?:$/.test(location.protocol); }
+  function gameUrl() { return location.href.split('#')[0].split('?')[0]; }
+  function linkFor(code) { return gameUrl() + '?room=' + encodeURIComponent(code); }
+  function copyText(t) {
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = t; ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;left:-9999px;top:0';
+      document.body.appendChild(ta); ta.select();
+      var ok = false;
+      try { ok = document.execCommand && document.execCommand('copy'); } catch (e) {}
+      document.body.removeChild(ta);
+      toast(ok ? 'LINK COPIED' : t);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      try {
+        navigator.clipboard.writeText(t).then(function () { toast('LINK COPIED'); }, fallback);
+      } catch (e) { fallback(); }
+    } else fallback();
+  }
+  function renderShareLine() {
+    var line = $('#shareLine');
+    if (!line) return;
+    var web = isHosted();
+    line.hidden = !web;
+    var t = $('#gameLinkText');
+    if (t) t.textContent = web ? gameUrl() : '';
+    var rl = $('#roomLinkText');
+    if (rl) rl.hidden = !web;
+  }
+  function setRoomQuery(code) {
+    try { history.replaceState(null, '', code ? '?room=' + encodeURIComponent(code) : location.pathname); } catch (e) {}
+  }
+  async function api(path, payload) {
+    var r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload || {}) });
+    return r.json();
+  }
+  async function createRoom() {
+    $('#onlineError').textContent = '';
+    var name = $('#createName').value.trim() || 'Player 1';
+    ui.onlinePlayers = selectedPlayers('#onlinePlayers');
+    try {
+      var d = await api('/api/rooms', {
+        name: name, players: ui.onlinePlayers, manualDice: $('#onlineManual').checked
+      });
+      if (d.error) { $('#onlineError').textContent = d.error; return; }
+      online = { code: d.code, seat: d.seat, token: d.token, version: d.version, state: d.state };
+      ui.mode = 'online';
+      setRoomQuery(d.code);
+      renderRoomCard(); startPoll();
+      toast('ROOM ' + d.code + ' CREATED');
+    } catch (e) { $('#onlineError').textContent = 'Could not reach the server.'; }
+  }
+  async function joinRoom() {
+    $('#onlineError').textContent = '';
+    var code = $('#joinCode').value.trim().toUpperCase();
+    var name = $('#joinName').value.trim() || 'Player';
+    if (!code) { $('#onlineError').textContent = 'Enter a room code.'; return; }
+    try {
+      var d = await api('/api/rooms/' + code + '/join', { name: name });
+      if (d.error) { $('#onlineError').textContent = d.error; return; }
+      online = { code: d.code, seat: d.seat, token: d.token, version: d.version, state: d.state };
+      ui.mode = 'online';
+      setRoomQuery(d.code);
+      renderRoomCard(); startPoll();
+      toast('JOINED AS SEAT ' + (d.seat + 1));
+    } catch (e) { $('#onlineError').textContent = 'Could not reach the server.'; }
+  }
+  function startPoll() {
+    var gen = ++pollGeneration;
+    (async function loop() {
+      while (gen === pollGeneration && ui.mode === 'online' && online.token) {
+        // Snapshot the request: a delayed reply from an older room or an older
+        // game must never roll the current screen back to a stale GAME OVER.
+        var code = online.code, seat = online.seat, token = online.token, requestVersion = online.version;
+        try {
+          var r = await fetch('/api/rooms/' + code + '/state?seat=' + seat + '&token=' + token + '&version=' + requestVersion);
+          var d = await r.json();
+          if (gen !== pollGeneration || ui.mode !== 'online' || online.code !== code || online.seat !== seat || online.token !== token) continue;
+          if (d.error) { $('#onlineError').textContent = d.error; break; }
+          if (!online.state || (d.version >= requestVersion && d.version >= online.version)) {
+            online.version = d.version; online.state = d.state;
+            if (ui.screen === 'setup' && d.state.phase === 'lobby') renderRoomCard();
+            else render();
+          }
+        } catch (e) { /* transient; retry */ }
+        await new Promise(function (res) { setTimeout(res, 250); });
+      }
+    })();
+  }
+  async function postAction(action) {
+    if (!online.token) return;
+    var gen = pollGeneration, code = online.code, seat = online.seat, token = online.token;
+    try {
+      var d = await api('/api/rooms/' + code + '/action', { seat: seat, token: token, action: action });
+      if (d.error) { toast(d.error); return; }
+      if (gen !== pollGeneration || ui.mode !== 'online' || online.code !== code || online.seat !== seat || online.token !== token) return;
+      if (!online.state || d.version >= online.version) {
+        online.version = d.version; online.state = d.state;
+        render();
+      }
+    } catch (e) { toast('CONNECTION ISSUE — RETRYING'); }
+  }
+  function leaveRoom() {
+    pollGeneration++;
+    if (online.token) api('/api/rooms/' + online.code + '/leave', { seat: online.seat, token: online.token }).catch(function () {});
+    online = { code: '', seat: 0, token: '', version: 0, state: null };
+    ui.mode = 'menu'; ui.screen = 'setup';
+    $('#onlineForms').hidden = false; $('#roomCard').hidden = true;
+    setRoomQuery(''); renderShareLine();
+    render();
+  }
+
+  /* ---------------- actions ---------------- */
+  function act(action) {
+    if (ui.mode === 'local') {
+      E.apply(ui.localState, action);
+      saveLocal();
+      render();
+    } else if (ui.mode === 'online') postAction(action);
+  }
+  function focusSeat() {
+    var s = ui.localState;
+    if (!s) return 0;
+    if (s.reveal) return s.reveal.pid;
+    if (s.prompt) return s.prompt.forPid;
+    return s.turnIndex;
+  }
+  function currentView() {
+    if (ui.mode === 'local') {
+      if (!ui.localState) return null;
+      return E.view(ui.localState, focusSeat());
+    }
+    if (ui.mode === 'online') return online.state;
+    return null;
+  }
+
+  /* ---------------- game rendering ---------------- */
+  var POS = ['N', 'E', 'S', 'W'];
+  function renderGame() {
+    var v = currentView();
+    if (!v) {
+      $('#board').innerHTML = '<div class="empty-note">Start a game from the menu.</div>';
+      $('#turnPanel').innerHTML = '<h3>NO GAME</h3><p class="muted">Choose PASS &amp; PLAY or an ONLINE ROOM.</p>';
+      $('#mobileBar').hidden = true;
+      renderOverlay(null);
+      return;
+    }
+    $('#roundInfo').textContent = 'ROUND ' + v.round + ' · TURN ' + (v.turnIndex + 1) + ' · ' + (v.direction === 1 ? 'CLOCKWISE' : 'COUNTER-CLOCKWISE');
+    $('#boardHint').textContent = v.cfg.showMarkers ? 'S = SNAKE · L = LADDER · × = CURSED TILE' : 'NO SNAKES OR LADDERS PRINTED HERE — LOOK IN THE RULES';
+    renderBoard(v);
+    renderTurn(v);
+    renderPlayers(v);
+    renderHand(v);
+    renderDeck(v);
+    renderDM(v);
+    renderLog(v);
+    renderOverlay(v);
+    renderMobileBar(v);
+  }
+  function renderMobileBar(v) {
+    var bar = $('#mobileBar');
+    if (ui.screen !== 'game' || v.phase === 'gameover' || v.phase === 'lobby') { bar.hidden = true; return; }
+    bar.hidden = false;
+    var isActor = v.yourSeat === v.turnIndex;
+    var blocked = !!(v.reveal || v.prompt || v.waiting);
+    var turnName = v.players[v.turnIndex] ? v.players[v.turnIndex].name : '—';
+    var tile = v.players[v.turnIndex] ? v.players[v.turnIndex].tile : '—';
+    var h = '<div class="mb-info"><b>' + esc(turnName) + '</b><span>TILE ' + (tile < 0 ? '−' + Math.abs(tile) : tile) + ' · ROUND ' + v.round + '</span></div>';
+    if (blocked) h += '<button class="mb-btn" disabled>CARD</button>';
+    else if (!isActor) h += '<button class="mb-btn" disabled>WAIT</button>';
+    else if (!v.rolledThisTurn) h += '<button class="mb-btn primary" data-roll>ROLL</button>';
+    else if (v.canEndTurn) h += '<button class="mb-btn primary" data-end>END TURN</button>';
+    else h += '<button class="mb-btn" disabled>•••</button>';
+    h += '<button class="mb-btn" data-jumphand>HAND ' + (v.you ? v.you.hand.length : 0) + '</button>';
+    bar.innerHTML = h;
+  }
+  function renderBoard(v) {
+    var cursed = v.cursedTiles || [];
+    var here = v.players[v.turnIndex] ? v.players[v.turnIndex].tile : -999;
+    var html = '';
+    E.BOARD_GRID.forEach(function (row) {
+      row.forEach(function (t) {
+        var cls = ['tile'];
+        if (t <= 0) cls.push('nemo');
+        if (t === 100) cls.push('finish');
+        if (t === here) cls.push('here');
+        if (cursed.indexOf(t) >= 0) cls.push('cursed');
+        var pawns = v.players.filter(function (p) { return p.alive && p.tile === t; })
+          .map(function (p) { return '<span class="pawn' + (p.i === v.turnIndex ? ' turn' : '') + '" title="' + esc(p.name) + '">' + (p.i + 1) + '</span>'; }).join('');
+        var mark = '';
+        if (v.cfg.showMarkers && t > 0) {
+          if (E.SNAKES[t] != null) mark = 'S ' + E.SNAKES[t];
+          else if (E.LADDERS[t] != null) mark = 'L ' + E.LADDERS[t];
+        }
+        if (t === -9) mark = 'NEMO';
+        if (t === 0) mark = 'EXIT';
+        if (t === 100) mark = 'WIN';
+        var dot = (v.cfg.sequenceWin && (t === 3 || t === 7 || t === 13)) ? '<span class="seqdot"></span>' : '';
+        var num = t < 0 ? '−' + Math.abs(t) : String(t);
+        html += '<div class="' + cls.join(' ') + '" data-tile="' + t + '" title="Tile ' + t + '">' +
+          '<span class="num">' + num + '</span>' + dot +
+          '<span class="mark">' + esc(mark) + '</span>' +
+          '<span class="pawns">' + pawns + '</span></div>';
+      });
+    });
+    $('#board').innerHTML = html;
+  }
+  function renderTurn(v) {
+    var isActor = v.yourSeat === v.turnIndex;
+    var turnName = v.players[v.turnIndex] ? v.players[v.turnIndex].name : '—';
+    var blocked = !!(v.reveal || v.prompt || v.waiting);
+    var h = '<h3>TURN</h3><div class="turn-line"><b>' + esc(turnName) + '</b><span>SEAT ' + (v.turnIndex + 1) + ' / TILE ' + (v.players[v.turnIndex] ? v.players[v.turnIndex].tile : '—') + '</span></div>';
+    h += '<div class="die">' + (v.lastDieRaw == null ? '–' : v.lastDieRaw) + '</div>';
+    if (v.lastDieRaw != null && v.lastDie !== v.lastDieRaw) h += '<p class="muted" style="margin-top:-8px">modified roll → ' + v.lastDie + '</p>';
+    if (v.phase === 'lobby') h += '<p class="muted">Waiting for the host to start.</p>';
+    else if (blocked) h += '<div class="waiting-note">Resolving a card…</div>';
+    else if (!isActor) h += '<div class="waiting-note">Waiting for ' + esc(turnName) + '.</div>';
+    else if (!v.rolledThisTurn) {
+      h += '<button class="bigbtn" data-roll>ROLL d6</button>';
+      if (v.cfg.manualDice) {
+        h += '<div class="muted" style="font-size:10px;letter-spacing:.12em;margin-bottom:6px">OR ENTER YOUR OWN ROLL</div><div class="manual">' +
+          [1, 2, 3, 4, 5, 6].map(function (n) { return '<button data-manual="' + n + '">' + n + '</button>'; }).join('') + '</div>';
+      }
+    } else if (v.canEndTurn) h += '<button class="bigbtn" data-end>END TURN</button><button class="bigbtn secondary" data-undo>UNDO LAST ACTION</button>';
+    else h += '<div class="waiting-note">Resolving…</div>';
+    $('#turnPanel').innerHTML = h;
+  }
+  function renderPlayers(v) {
+    var h = '<h3>PAWNS &amp; STATUS</h3><div class="plist">';
+    v.players.forEach(function (p) {
+      h += '<div class="prow' + (p.i === v.turnIndex ? ' current' : '') + (p.alive ? '' : ' dead') + '">' +
+        '<span class="pnum">' + (p.i + 1) + '</span>' +
+        '<span><span class="pname">' + esc(p.name) + '</span>' +
+        '<span class="tags">' + p.statuses.map(function (s) { return '<span class="tag">' + esc(s) + '</span>'; }).join('') +
+        '<span class="tag">' + p.handCount + ' CARD' + (p.handCount === 1 ? '' : 'S') + '</span></span></span>' +
+        '<span class="ptile">' + (p.tile < 0 ? '−' + Math.abs(p.tile) : p.tile) + '</span></div>';
+    });
+    h += '</div><div class="seatmap">';
+    var seats = { 0: 1, 1: 5, 2: 7, 3: 3 };
+    for (var i = 0; i < 9; i++) {
+      var pidx = -1;
+      Object.keys(seats).forEach(function (k) { if (seats[k] === i) pidx = Number(k); });
+      if (i === 4) h += '<div>·</div>';
+      else if (pidx >= 0 && pidx < v.players.length) h += '<div class="' + (pidx === v.turnIndex ? 'on' : '') + '">' + POS[pidx] + ' · ' + (pidx + 1) + '</div>';
+      else h += '<div>&nbsp;</div>';
+    }
+    h += '</div>';
+    $('#playersPanel').innerHTML = h;
+  }
+  function renderHand(v) {
+    var hand = v.you ? v.you.hand : [];
+    var h = '<h3>YOUR HAND' + (v.yourSeat != null ? ' · SEAT ' + (v.yourSeat + 1) : '') + '</h3>';
+    if (!hand.length) h += '<div class="empty-note">No cards in hand. Land on an even tile to draw.</div>';
+    else {
+      h += '<div class="handgrid">' + hand.map(function (c) {
+        var flag = c.sticky ? 'ONGOING' : (c.passive ? 'PASSIVE' : '');
+        return '<button class="hcard' + (c.sticky ? ' sticky' : '') + '" data-card="' + c.uid + '" title="' + esc(c.text) + '">' +
+          (flag ? '<span class="flag">' + flag + '</span>' : '') +
+          '<img src="' + c.img + '" alt="' + c.id.toUpperCase() + '" loading="lazy">' +
+          '<span class="cid">' + c.id.toUpperCase() + '</span></button>';
+      }).join('') + '</div>';
+      h += '<p class="muted" style="font-size:10px;margin:8px 0 0">Tap a card to play it. Do not show anyone your hand.</p>';
+    }
+    $('#handPanel').innerHTML = h;
+  }
+  function renderDeck(v) {
+    var last = v.discardTop || v.lastCard;
+    var h = '<h3>DECK / DISCARD</h3><div class="deckrow"><div class="deckstat"><div><b>' + v.deckCount + '</b>FACE DOWN</div><div><b>' + v.discardCount + '</b>PLAYED</div></div>';
+    h += last ? '<img class="lastcard" src="' + last.img + '" alt="' + last.id.toUpperCase() + '" title="' + last.id.toUpperCase() + ' — ' + esc(last.text) + '">' : '<div class="lastcard empty">NO CARD PLAYED</div>';
+    h += '</div>';
+    if (v.globalFlags && v.globalFlags.length) h += '<p class="muted" style="font-size:10px;margin:8px 0 0">' + esc(v.globalFlags.join(' · ')) + '</p>';
+    $('#deckPanel').innerHTML = h;
+  }
+  function renderDM(v) {
+    var allowed = ui.mode === 'local' || online.seat === 0;
+    $('#dmPanel').hidden = !allowed;
+    if (!allowed) return;
+    var h = '<select id="dmPlayer">' + v.players.map(function (p) {
+      return '<option value="' + p.i + '"' + (p.i === v.turnIndex ? ' selected' : '') + '>Player ' + (p.i + 1) + ' — ' + esc(p.name) + '</option>';
+    }).join('') + '</select>';
+    h += '<input id="dmTile" type="number" min="-9" max="100" value="1" placeholder="Tile number">';
+    h += '<div class="dm-grid">' +
+      '<button data-dm="settile">SET TILE</button><button data-dm="nemo">TO POINT NEMO</button>' +
+      '<button data-dm="p1">+1</button><button data-dm="m1">−1</button>' +
+      '<button data-dm="p5">+5</button><button data-dm="m5">−5</button>' +
+      '<button data-dm="draw">DRAW A CARD</button><button data-dm="eliminate">ELIMINATE</button>' +
+      '<button data-dm="reshuffle">RESHUFFLE</button><button data-dm="reverse">REVERSE ORDER</button>' +
+      '<button data-dm="clear">CLEAR RULES</button><button data-dm="end">FORCE END TURN</button>' +
+      '</div><button class="dm-wide" data-dm="undo">UNDO LAST ACTION</button>' +
+      '<button class="dm-wide" data-dm="privacy">PASS-THE-DEVICE SCREENS: ' + (ui.noPrivacy ? 'OFF' : 'ON') + '</button>' +
+      '<button class="dm-wide" data-dm="new">' + (ui.mode === 'online' ? 'RESET ROOM (HOST)' : 'NEW GAME') + '</button>';
+    h += '<p class="muted" style="font-size:10px;margin:8px 0 0">The table has the final say on anything the engine cannot judge.</p>';
+    $('#dmControls').innerHTML = h;
+  }
+  function renderLog(v) {
+    var lines = v.log.slice(-90).reverse();
+    $('#logPanel').innerHTML = '<h3>LOG</h3>' + lines.map(function (l) {
+      var thumb = l.cardId && C[l.cardId] ? '<img src="' + img(l.cardId) + '" alt="" loading="lazy">' : '';
+      return '<div class="logline' + (l.text.indexOf('— Round') === 0 ? ' turn' : '') + '"><span class="ln">' + l.n + '</span>' + thumb + '<span>' + esc(l.text) + '</span></div>';
+    }).join('');
+  }
+
+  /* ---------------- overlays ---------------- */
+  function overlayCardFace(c) {
+    return '<div class="cardface"><img src="' + c.img + '" alt="' + c.id.toUpperCase() + '"><div class="ftext">' + esc(c.text) + '</div></div>';
+  }
+  function renderOverlay(v) {
+    var ov = $('#overlay');
+    if (!v) { ov.hidden = true; ov.innerHTML = ''; ov.classList.remove('passive', 'privacy-screen'); return; }
+    if (ui.mode === 'local' && ui.noPrivacy) ui.privacySeat = focusSeat();
+    var h = '', cls = 'modal', passive = false, privacy = false;
+
+    if (v.phase === 'gameover') {
+      var w = v.winner == null ? null : v.players[v.winner];
+      h = '<div class="kicker">GAME OVER</div><h2>' + (w ? esc(w.name) + ' WINS' : 'NO ONE WINS') + '</h2>' +
+        '<p>' + esc(v.endReason || '') + '</p>' +
+        '<p class="muted">Some cards end the game immediately by design. The LOG shows the card and the full sequence of events.</p>' +
+        '<div class="actions">' +
+        '<button class="primary" data-newgame>NEW GAME</button><button class="ghost" data-menu>BACK TO MENU</button></div>';
+    } else if (ui.confirmCard) {
+      var c = ui.confirmCard;
+      h = '<div class="kicker">PLAY A CARD · ' + c.type.toUpperCase() + '</div><h2>' + c.id.toUpperCase() + '</h2>' + overlayCardFace(c) +
+        '<p>Playing resolves its effect and the card goes to the discard pile.</p><div class="actions">' +
+        '<button class="primary" data-playconfirm>PLAY</button><button class="ghost" data-cancelconfirm>CANCEL</button></div>';
+    } else if (ui.mode === 'local' && !ui.noPrivacy && ui.privacySeat !== focusSeat()) {
+      var f = focusSeat(), nm = v.players[f] ? v.players[f].name : 'Player ' + (f + 1);
+      privacy = true;
+      h = '<div class="frame"><div class="kicker">PASS THE DEVICE</div>' +
+        '<div class="pnum">' + (f + 1) + '</div><h2>' + esc(nm) + '</h2>' +
+        '<p>The board and every hand stay hidden until you confirm it is your turn. Make sure nobody else can see the screen.</p>' +
+        '<button class="primary" data-privacy>I’M ' + esc(nm) + ' — REVEAL</button>' +
+        '<div class="hint">PRESS ENTER, OR TAP ANYWHERE ON THIS SCREEN</div>' +
+        '<button class="skip" data-noprivacy>TURN OFF THESE SCREENS FOR THIS DEVICE</button></div>';
+      cls = 'modal privacy';
+    } else if (v.reveal) {
+      var r = v.reveal, owner = v.players[r.pid] ? v.players[r.pid].name : 'the player';
+      h = '<div class="kicker">DRAWN CARD · ' + r.card.type.toUpperCase() + ' · ' + (r.kept ? 'KEPT IN HAND' : 'PLAYED IMMEDIATELY') + '</div>' +
+        '<h2>' + r.card.id.toUpperCase() + '</h2>' + overlayCardFace(r.card) +
+        (r.jazz ? '<button class="ghost" data-jazz>PLAY JAZZ (GC25)</button>' : '') +
+        '<div class="actions">' + (v.canAck ? '<button class="primary" data-ack>CONTINUE</button>' : '<button class="ghost" disabled>WAITING FOR ' + esc(owner) + '</button>') + '</div>';
+    } else if (v.prompt && v.canAnswer) {
+      var p = v.prompt;
+      h = '<div class="kicker">' + (p.cardId ? p.cardId.toUpperCase() + ' · ' : '') + 'DECISION</div><h2>' + esc(p.title) + '</h2><p>' + esc(p.text) + '</p>';
+      if (p.peek && p.peek.length) h += '<div class="peek">' + p.peek.map(function (c) { return '<img src="' + c.img + '" title="' + c.id.toUpperCase() + ' — ' + esc(c.text) + '">'; }).join('') + '</div>';
+      h += '<div class="optlist">' + p.options.map(function (o, i) {
+        return '<button class="opt" data-opt="' + i + '"' + (o.disabled ? ' disabled' : '') + '>' +
+          (o.img ? '<img src="' + o.img + '" alt="">' : '') + '<span class="ol">' + esc(o.label) + '</span></button>';
+      }).join('') + '</div>';
+    } else if (v.waiting) {
+      h = '<div class="kicker">WAITING</div><h2>' + esc(v.waiting.name) + '</h2><p>' + esc(v.waiting.title || 'is looking at a card. Hands stay private until they are done.') + '</p>';
+      cls = 'modal banner'; passive = true;
+    }
+    if (!h) { ov.hidden = true; ov.innerHTML = ''; ov.classList.remove('passive', 'privacy-screen'); return; }
+    ov.hidden = false;
+    ov.classList.toggle('passive', passive);
+    ov.classList.toggle('privacy-screen', privacy);
+    ov.innerHTML = '<div class="' + cls + '">' + h + '</div>';
+  }
+
+  /* ---------------- card index ---------------- */
+  function renderCards() {
+    var q = ui.cardQuery.toLowerCase().trim();
+    var list = E.CARD_IDS.filter(function (id) {
+      var c = C[id];
+      if (ui.cardFilter !== 'All' && c.type !== ui.cardFilter) return false;
+      if (q && (id + ' ' + c.text + ' ' + c.type).toLowerCase().indexOf(q) < 0) return false;
+      return true;
+    });
+    $('#cardCount').textContent = list.length + ' / 108';
+    $('#cardGrid').innerHTML = list.map(function (id) {
+      var c = C[id];
+      return '<div class="carditem"><img src="' + c.img + '" alt="' + id.toUpperCase() + '" loading="lazy">' +
+        '<div class="cid"><span>' + id.toUpperCase() + '</span><span>' + c.type.toUpperCase() + '</span></div>' +
+        '<div class="ct">' + esc(c.text) + '</div></div>';
+    }).join('');
+  }
+
+  /* ---------------- events ---------------- */
+  function bind() {
+    $('#nav').addEventListener('click', function (e) {
+      var b = e.target.closest('.nav-btn'); if (b) go(b.dataset.screen);
+    });
+    $('#brandBtn').addEventListener('click', function () { if (ui.mode !== 'menu') go('game'); else go('setup'); });
+    $('#jazzBtn').addEventListener('click', function () { toggleJazz(); });
+    $('#invertBtn').addEventListener('click', function () {
+      ui.light = !ui.light; document.body.classList.toggle('light', ui.light);
+      $('#invertBtn').textContent = ui.light ? 'BLACK' : 'INVERT';
+      savePrefs();
+    });
+
+    // menu: local
+    $('#localPlayers').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      $$('#localPlayers button').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on'); ui.localPlayers = Number(b.dataset.n); renderNames();
+    });
+    $('#onlinePlayers').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      $$('#onlinePlayers button').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on'); ui.onlinePlayers = Number(b.dataset.n);
+    });
+    $('#startLocal').addEventListener('click', function () { startLocal(false); });
+    $('#resumeLocal').addEventListener('click', function () { startLocal(true); });
+
+    // menu: online
+    $('#createRoom').addEventListener('click', createRoom);
+    $('#joinRoom').addEventListener('click', joinRoom);
+    $('#startOnline').addEventListener('click', function () { postAction({ type: 'START' }); });
+    $('#copyLink').addEventListener('click', function () { copyText(linkFor(online.code)); });
+    $('#copyGameLink').addEventListener('click', function () { copyText(gameUrl()); });
+    $('#roomLinkText').addEventListener('click', function () { copyText(linkFor(online.code)); });
+    $('#leaveRoom').addEventListener('click', leaveRoom);
+
+    // game: turn panel
+    function turnButton(b) {
+      if (!b) return;
+      if (b.dataset.jumphand !== undefined) {
+        var hp = $('#handPanel');
+        if (hp && hp.scrollIntoView) hp.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+      if (b.dataset.roll !== undefined) act({ type: 'ROLL' });
+      else if (b.dataset.manual) act({ type: 'ROLL', value: Number(b.dataset.manual) });
+      else if (b.dataset.end !== undefined) act({ type: 'END_TURN' });
+      else if (b.dataset.undo !== undefined) act({ type: 'UNDO' });
+    }
+    function onTurnClick(e) { turnButton(e.target.closest('button')); }
+    $('#turnPanel').addEventListener('click', onTurnClick);
+    $('#mobileBar').addEventListener('click', onTurnClick);
+    // hand
+    $('#handPanel').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-card]'); if (!b) return;
+      var v = currentView(); if (!v || !v.you) return;
+      var c = v.you.hand.find(function (x) { return x.uid === Number(b.dataset.card); });
+      if (c) { ui.confirmCard = c; renderOverlay(v); }
+    });
+    // dm
+    $('#dmControls').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-dm]'); if (!b) return;
+      var pid = Number($('#dmPlayer').value), tile = Number($('#dmTile').value) || 1;
+      var k = b.dataset.dm;
+      if (k === 'settile') act({ type: 'DM_SET_TILE', pid: pid, tile: tile });
+      else if (k === 'nemo') act({ type: 'DM_NEMO', pid: pid });
+      else if (k === 'p1') act({ type: 'DM_MOVE', pid: pid, delta: 1 });
+      else if (k === 'm1') act({ type: 'DM_MOVE', pid: pid, delta: -1 });
+      else if (k === 'p5') act({ type: 'DM_MOVE', pid: pid, delta: 5 });
+      else if (k === 'm5') act({ type: 'DM_MOVE', pid: pid, delta: -5 });
+      else if (k === 'draw') act({ type: 'DM_DRAW', pid: pid, count: 1 });
+      else if (k === 'eliminate') act({ type: 'DM_ELIMINATE', pid: pid });
+      else if (k === 'reshuffle') act({ type: 'DM_RESHUFFLE' });
+      else if (k === 'reverse') act({ type: 'DM_REVERSE' });
+      else if (k === 'clear') act({ type: 'DM_CLEAR_RULES' });
+      else if (k === 'end') act({ type: 'DM_END_TURN' });
+      else if (k === 'undo') act({ type: 'UNDO' });
+      else if (k === 'privacy') {
+        ui.noPrivacy = !ui.noPrivacy; savePrefs();
+        ui.privacySeat = ui.noPrivacy ? focusSeat() : null;
+        toast(ui.noPrivacy ? 'PASS-THE-DEVICE SCREENS OFF' : 'PASS-THE-DEVICE SCREENS ON');
+        render();
+      }
+      else if (k === 'new') {
+        if (ui.mode === 'online') postAction({ type: 'RESET' });
+        else startLocal(false);
+      }
+    });
+
+    // overlay
+    $('#overlay').addEventListener('click', function (e) {
+      var isPrivacy = $('#overlay').classList.contains('privacy-screen');
+      var b = e.target.closest('button');
+      if (!b) { if (isPrivacy) { ui.privacySeat = focusSeat(); render(); } return; }
+      if (b.dataset.noprivacy !== undefined) {
+        ui.noPrivacy = true; savePrefs(); ui.privacySeat = focusSeat();
+        toast('PASS-THE-DEVICE SCREENS OFF'); render(); return;
+      }
+      if (isPrivacy && b.dataset.privacy === undefined) { ui.privacySeat = focusSeat(); render(); return; }
+      var v = currentView();
+      if (b.dataset.privacy !== undefined) { ui.privacySeat = focusSeat(); render(); }
+      else if (b.dataset.ack !== undefined) act({ type: 'ACK' });
+      else if (b.dataset.jazz !== undefined) toggleJazz(true);
+      else if (b.dataset.opt !== undefined && v && v.prompt) {
+        var o = v.prompt.options[Number(b.dataset.opt)];
+        if (o && !o.disabled) act({ type: 'ANSWER', value: o.value });
+      }
+      else if (b.dataset.playconfirm !== undefined) {
+        var c = ui.confirmCard; ui.confirmCard = null;
+        if (c) act({ type: 'PLAY_CARD', uid: c.uid });
+      }
+      else if (b.dataset.cancelconfirm !== undefined) { ui.confirmCard = null; render(); }
+      else if (b.dataset.newgame !== undefined) {
+        if (ui.mode === 'online') postAction({ type: 'RESET' });
+        else startLocal(false);
+      }
+      else if (b.dataset.menu !== undefined) { pollGeneration++; ui.mode = 'menu'; ui.screen = 'setup'; render(); }
+    });
+
+    // card index
+    $('#cardFilter').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      $$('#cardFilter button').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on'); ui.cardFilter = b.dataset.f; renderCards();
+    });
+    $('#cardSearch').addEventListener('input', function (e) { ui.cardQuery = e.target.value; renderCards(); });
+
+    // keyboard: 1-6 manual dice, enter to continue
+    document.addEventListener('keydown', function (e) {
+      if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
+      if ($('#overlay').classList.contains('privacy-screen') && (e.key === 'Enter' || e.key === ' ')) {
+        e.preventDefault(); ui.privacySeat = focusSeat(); render(); return;
+      }
+      var v = currentView();
+      if (v && v.reveal && v.canAck && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); act({ type: 'ACK' }); }
+    });
+  }
+
+  function init() {
+    bind();
+    renderNames();
+    renderShareLine();
+    try {
+      ui.light = localStorage.getItem('vusal.light') === '1';
+      ui.noPrivacy = localStorage.getItem('vusal.noPrivacy') === '1';
+    } catch (e) {}
+    document.body.classList.toggle('light', ui.light);
+    $('#optPrivacy').checked = ui.noPrivacy;
+    $('#invertBtn').textContent = ui.light ? 'BLACK' : 'INVERT';
+    var params = new URLSearchParams(location.search);
+    if (params.get('room')) { $('#joinCode').value = params.get('room').toUpperCase(); $('#joinName').focus(); }
+    if (!/^https?:$/.test(location.protocol)) {
+      var note = document.createElement('p');
+      note.className = 'muted';
+      note.style.cssText = 'font-size:11px;margin-top:14px;border-top:1px solid var(--line2);padding-top:10px';
+      note.textContent = 'Standalone file: PASS & PLAY works offline. ONLINE ROOMS need the server build (npm start). For different houses, tunnel or deploy it — see DEPLOY.md in the full-game ZIP.';
+      $('#onlineForms').appendChild(note);
+    }
+    go('setup');
+  }
+  init();
+})();

@@ -1,0 +1,45 @@
+VUSAL — very unfair snakes and ladders
+=====================================
+
+EASIEST
+  Double-click VUSAL-standalone.html. It opens in any browser, needs no
+  install and no internet. Pass & play works fully.
+
+ONLINE ROOMS WITH FRIENDS
+  Install Node.js (18 or newer), then in this folder run:
+      npm start       (or: node server.js)
+  On that computer open http://localhost:3000. Other devices use the
+  computer's LAN IP (same house) or the public HTTPS URL (different houses).
+  Create a room, share the code or link, fill every selected seat, and
+  the host presses START GAME.
+
+ON A PHONE
+  One phone, offline: open VUSAL-standalone.html in a browser.
+    Android: download it, open with Chrome.
+    iPhone: Files' Quick Look does NOT run JavaScript. Use Share ->
+    "Open in Safari" or open the game from a web address instead.
+
+  Group play on phones: run `npm start` on a computer on the same
+  Wi-Fi, then open http://<that-computer's-IP>:3000 on every phone.
+  No internet needed. Example: http://192.168.1.42:3000
+
+NOT IN THE SAME HOUSE
+  The Arena preview link is token-protected; friends get a 403. Put the
+  server on the internet instead:
+    Quick:  run `npm start`, then in a second terminal
+            `cloudflared tunnel --url http://localhost:3000`
+            (or `ngrok http 3000`, or `npm run tunnel`).
+            Send everyone the https://... URL. Keep the computer on.
+    Permanent: deploy this folder to Render / Railway / Fly.io / a VPS
+            with start command `npm start`. Share its https URL.
+    No laptop: use VUSAL-cloud.zip (or the cloud/ folder). It has four
+            files; upload them to GitHub from a phone browser and let
+            Render/Koyeb deploy them. See cloud/DEPLOY-PHONE.md.
+  Full steps: DEPLOY.md.
+
+EVERYTHING ELSE
+  README.md — full instructions, including mobile, rules, house interpretations.
+  DEPLOY.md — remote hosting.
+  exports/  — your original PCIO CSVs, now with real card image URLs.
+
+The game, rules, booklet and card art are by Quevin Amoh Markin.
