@@ -832,7 +832,7 @@
         pushBanner(state, { kind: 'card', cardId: card910, cards: sent910.map(cardView), private: true,
           title: label(card910) + ' — CARDS RECEIVED',
           text: nameOf(state, pid) + ' gave ' + sent910.map(function (c) { return label(c.id); }).join(' & ') + ' to ' + nameOf(state, value) + '.',
-          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+          actor: pid, pendingPids: [value] });
         break;
       }
       case 'bc11_target':
@@ -914,7 +914,7 @@
         pushBanner(state, { kind: 'card', cardId: 'vc1', card: cardView(c1), private: true,
           title: 'VC1 — CARD RECEIVED',
           text: nameOf(state, pid) + ' gave ' + label(c1.id) + ' to ' + nameOf(state, pr.data.target) + '.',
-          actor: pid, pendingPids: [state.cfg.practiceBot && pr.data.target > 0 ? 0 : pr.data.target] });
+          actor: pid, pendingPids: [pr.data.target] });
         break;
       }
       case 'vc6_target': {
@@ -959,7 +959,7 @@
         pushBanner(state, { kind: 'card', cardId: 'vc26', cards: hA.map(cardView), private: true,
           title: 'VC26 — HANDS SWAPPED',
           text: nameOf(state, pid) + ' swapped hands with ' + nameOf(state, value) + '. Received ' + hA.length + ' card(s).',
-          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+          actor: pid, pendingPids: (state.cfg.practiceBot && pid === 0 && value > 0) ? [0, value] : [value] });
         break;
       }
       case 'vc31_target':
@@ -1272,7 +1272,7 @@
         pushBanner(state, { kind: 'card', cardId: 'gc29', card: cardView(stolen), private: true,
           title: 'GC29 — CARD STOLEN',
           text: nameOf(state, pid) + ' stole ' + label(stolen.id) + ' from ' + nameOf(state, nxt) + '.',
-          actor: pid, pendingPids: state.cfg.practiceBot ? [0] : (nxt !== pid ? [nxt, pid] : [pid]) });
+          actor: pid, pendingPids: nxt !== pid ? [nxt, pid] : [pid] });
         transferCard(state, nxt, pid, stolen);
         break;
       }
@@ -1608,7 +1608,7 @@
       pushBanner(state, { kind: 'card', cardId: 'vc22', card: cardView(card), private: true,
         title: 'VC22 — CARD SNATCHED',
         text: nameOf(state, thief) + ' snatched ' + label(card.id) + ' from ' + nameOf(state, pid) + ' the moment it was played.',
-        actor: thief, pendingPids: state.cfg.practiceBot ? [0] : [pid, thief] });
+        actor: thief, pendingPids: [pid, thief] });
       transferCard(state, pid, thief, card);
       return;
     }
@@ -1634,14 +1634,23 @@
     if (!state.banners) state.banners = [];
     if (!state.milestones) state.milestones = [];
     var t = action.type;
-    if (t === 'UNDO') return undo(state);
-    if (t === 'SET_NAME' && state.phase === 'lobby' && state.players[action.pid]) {
-      state.players[action.pid].name = String(action.name || '').slice(0, 24) || ('Player ' + (action.pid + 1));
-      state.version++;
+    if (t === 'UNDO') {
+      if (action.seat != null && action.seat !== 0) return state;
+      return undo(state);
+    }
+    if (t === 'SET_NAME') {
+      if (state.phase === 'lobby' && state.players[action.pid] && !(action.seat != null && action.pid !== action.seat)) {
+        state.players[action.pid].name = String(action.name || '').slice(0, 24) || ('Player ' + (action.pid + 1));
+        state.version++;
+      }
       return state;
     }
-    if (t === 'START') { startGame(state); state.version++; return state; }
+    if (t === 'START') {
+      if (action.seat != null && action.seat !== 0) return state;
+      startGame(state); state.version++; return state;
+    }
     if (t === 'SET_CONFIG') {
+      if (action.seat != null && action.seat !== 0) return state;
       if (state.phase !== 'lobby' && action.cfg && action.cfg.players != null) return state;
       Object.assign(state.cfg, action.cfg || {});
       var n = clamp(Number(state.cfg.players) || state.players.length, 1, 4);
@@ -1678,8 +1687,10 @@
     if (t === 'ACK_ELIM') {
       if (state.banners.length && state.banners[0].kind === 'out') {
         var ob = state.banners[0];
-        if (action.seat != null && ob.pendingPids.indexOf(action.seat) >= 0) {
-          ob.pendingPids.splice(ob.pendingPids.indexOf(action.seat), 1);
+        if (action.seat != null) {
+          var epos = ob.pendingPids.indexOf(action.seat);
+          if (epos < 0) return state;
+          ob.pendingPids.splice(epos, 1);
         } else {
           ob.pendingPids.length = 0;
         }

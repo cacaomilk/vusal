@@ -255,9 +255,13 @@ async function handleApi(req, res, url) {
         if (room.seatActive) delete room.seatActive[String(pid)];
       }
       engine.apply(room.state, { type: 'SET_CONFIG', cfg: nextCfg });
+    } else if ((String(a.type || '').indexOf('DM_') === 0 || a.type === 'UNDO') && seat !== 0) {
+      return json(res, 403, { error: 'Only the host can do that.' });
     } else {
       a.seat = seat;
+      var beforeVer = room.state.version;
       engine.apply(room.state, a);
+      if (room.state.version === beforeVer) return json(res, 200, publicRoom(room, seat));
     }
     changed(room);
     return json(res, 200, publicRoom(room, seat));
