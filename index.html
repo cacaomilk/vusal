@@ -22,7 +22,6 @@
       <button data-screen="game" class="nav-btn">GAME</button>
       <button data-screen="cards" class="nav-btn">CARDS</button>
       <button data-screen="rules" class="nav-btn">RULES</button>
-      <button data-screen="booklet" class="nav-btn">BOOKLET</button>
       <button data-screen="setup" class="nav-btn">MENU</button>
     </nav>
     <div class="topright">
@@ -97,6 +96,9 @@
             <div class="room-code"><span>ROOM</span><strong id="roomCodeText">—</strong><button class="ghost small" id="copyLink">COPY LINK</button></div>
             <p class="muted" id="roomSeatLine"></p>
             <p class="room-link" id="roomLinkText"></p>
+            <label class="field" id="partySizeLabel">PLAYERS
+              <div class="seg" id="partySize"><button data-n="2">2</button><button data-n="3">3</button><button data-n="4">4</button></div>
+            </label>
             <ul class="seat-list" id="roomSeats"></ul>
             <div class="row">
               <button class="primary" id="startOnline" hidden>START GAME</button>
@@ -104,6 +106,23 @@
             </div>
           </div>
           <p class="error" id="onlineError"></p>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head"><span>03</span><h2>PRACTICE (BOTS)</h2></div>
+          <p class="muted">Play against computer-controlled bots on one device. No privacy screens — everything is open.</p>
+          <label class="field">YOUR NAME <input id="practiceName" maxlength="24" placeholder="Player 1"></label>
+          <label class="field">BOTS
+            <div class="seg" id="practiceBots"><button data-n="1" class="on">1</button><button data-n="2">2</button><button data-n="3">3</button></div>
+          </label>
+          <div class="checks">
+            <label><input type="checkbox" id="optPracticeExact" checked> Exact roll needed to land on 100</label>
+            <label><input type="checkbox" id="optPracticeSequence" checked> 3 → 7 → 13 wins in order · one step per turn</label>
+            <label><input type="checkbox" id="optPracticeMarkers"> Print snakes &amp; ladders on the board</label>
+          </div>
+          <div class="row">
+            <button class="primary" id="startPractice">START PRACTICE</button>
+          </div>
         </div>
       </div>
 
@@ -131,6 +150,11 @@
           <div class="board-foot">
             <span>BOTTOM ROW: POINT NEMO (−9 → 0)</span>
             <span id="boardHint">NO SNAKES OR LADDERS PRINTED HERE — LOOK IN THE RULES</span>
+          </div>
+          <div class="card-activity empty" id="cardActivity">
+            <h3>LAST CARD</h3>
+            <div id="cardActivityFace"></div>
+            <div id="cardActivityText"></div>
           </div>
         </div>
 
@@ -236,54 +260,6 @@
           <p>Create a room in the menu and share the code or link. Each player joins on their own device and is assigned a seat. Fill every selected seat; only the host starts the game, and START creates a fresh state for everyone. Each seat sees only its own hand; the deck, discard and log are shared. The host has DM controls for anything the table wants to overrule.</p>
           <p>On phones, same Wi‑Fi: run <b>npm start</b> on a computer and open <b>http://&lt;computer-IP&gt;:3000</b> on each phone. No internet needed. If players are in different houses, use a tunnel or deploy the server to a public HTTPS URL, then share the game link; <b>DEPLOY.md</b> in the full-game ZIP has the steps. One phone on its own can play pass &amp; play from the standalone HTML file, but online rooms need the server.</p>
         </div>
-      </div>
-    </section>
-
-    <!-- ================= BOOKLET ================= -->
-    <section class="screen" id="screen-booklet">
-      <div class="page-head"><h1>BOOKLET</h1><p class="sub">The note that came with the game.</p></div>
-      <div class="prose narrow">
-        <h2>..how did we get here?</h2>
-        <p>Hey, it's me, the guy who created the whole game. You'll probably be one of the first, if not the first to ever see this note (if I see this online, I'm gonna be under your bed) but thank you so much for taking the honours of being the first to both play this and even take the time to read this note. If I'm honest, I've been through hell and back mentally and physically trying to get this project finished and the fact you're genuinely here to experience it - the fact I'm currently alive while writing this - means so much to me. So, again, thank you for everything and that's all the heartfelt stuff for today - jump into the game and make your friends never trust you with choosing what to play again!</p>
-        <p>..actually, I want to say thank you just one more time.</p>
-        <p><strong>Thank you!</strong><br><span class="muted">Quevin Amoh Markin</span></p>
-
-        <h2>Wait, what's all this?</h2>
-        <p>Good question. You're reading the booklet to the game of luck, unluck (I had to Google if that was a word or not), and all-around pettiness - and it's snakes and ladders. It's literally just snakes and ladders. Except worse.</p>
-        <p>Or better, if you're a masochist.</p>
-
-        <h2>I just wanted Snakes &amp; Ladders, man.</h2>
-        <p>Well, this isn't it. Moving on.</p>
-
-        <h2>Why are there cards in this box?</h2>
-        <p>Because you're going to use them. Every time you land on an even-numbered tile, you have to draw a card from the deck. Unless the card you draw says to immediately play it, or plays an active/ongoing effect on you, you can hold onto that card - but make sure not to show anyone your hand or you're eliminated and have to put your cards in the deck and reshuffle (unless you're playing against one other person. Then they just win). If the effect works against you, you have to play the card. If the effect of the card is ongoing and not a Good card, you cannot play it to get rid of the effect. Playing a card resolves its effects, so it will stop functioning entirely after it is played in a match.</p>
-        <p>There are three card types and 36 of each (in this version of the game, at least). They are 'Good', identifiable by its use of light and cold colours; 'Bad' identifiable by its use of dark and warm colours and 'Vertigo', identifiable by its use of solely neutral colours.</p>
-        <p>The first two are fairly self-explanatory. Good is beneficial, Bad acts against you, but Vertigo? Those could potentially be a huge make-or-break. They're not just neutral, but they have cards that have effects that vary so much in each situation that they don't fit in either of the prior-mentioned categories.</p>
-
-        <h2>Deck?</h2>
-        <p>'Course there's a deck! How else would you get cards? You put the deck beside the board, shuffled 'n' face down and every played card goes on the other side of the board, face up. Simple.</p>
-
-        <h2>Alright, so how do you win?</h2>
-        <p>Get to Tile 100 first. Buuut, if you ever land on these numbers in order: 3, 7, 13 — you win! There are also a few cards that automatically cause you to win.</p>
-
-        <h2>And why are there 110 tiles?</h2>
-        <p>That's because of Point Nemo! You start at Tile 1, but right under that lies Tile 0 to −9, and if you wind up there, you can't actually draw any cards but every single roll will move you away from Tile −9. Land on −9 and you lose. Roll an exact number back onto zero and you escape onto Tile 1; if you're already on zero, roll a one. Oh, and every time it's your turn in there, it drags you back one tile before you roll, so.. have fun!</p>
-
-        <h2>Hold on, I don't see any Snakes or Ladders..</h2>
-        <p>Exactly. I didn't put any of them on there so I can force you to look inside the rulebook every time.</p>
-        <h2>Why would you do that?</h2>
-        <p>The following are snakes: 17 to 14, 46 to 27, 73 to 63, 84 to 68, 99 to 1, 13 to −1.</p>
-        <h2>WHY WOULD YOU DO THAT??</h2>
-        <p>The following are ladders: 14 to 40, 21 to 33, 28 to 34, 57 to 79, 62 to 90.</p>
-
-        <h2>How do I set the atmosphere for the game?</h2>
-        <p>Play some jazz. Or don't. Some bossa nova would be nice, though.</p>
-
-        <h2>..wait, more important question, how do I even keep track of my tile?</h2>
-        <p>Yeah, I realised that was a problem mid-development. Put your assigned pawn on your tile.</p>
-
-        <h2>No, let's not brush past that - what do you mean pawns?</h2>
-        <p>Pawns are assigned to players by number. Pawns indicate your tile at a particular moment. Each pawn has a number from 1 - 4 inscribed on it. Numbers also determine turn order. In addition, players must sit clockwise according to turn order. To make it easier, let's say you're at a table. Player 1 would sit north of the table, player 2 would sit east, player 3 would sit south and player 4 would sit west. One 'round' of the game would be reaching (or, in some cases, surpassing) the turn of player 1.</p>
       </div>
     </section>
   </main>

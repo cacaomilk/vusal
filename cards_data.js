@@ -553,7 +553,7 @@
   "vc20": {
     "id": "vc20",
     "type": "Vertigo",
-    "text": "The game ends. No one wids. (well, that's a dumb card)",
+    "text": "The game ends. No one wins. (well, that's a dumb card)",
     "img": "assets/cards/vc20.png"
   },
   "vc21": {

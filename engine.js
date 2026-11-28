@@ -42,6 +42,14 @@
   function P(state, pid) { return state.players[pid]; }
   function cur(state) { return state.players[state.turnIndex]; }
   function nextSeat(state, pid) { return (pid + state.direction + N(state) * 2) % N(state); }
+  function nextAliveSeat(state, pid) {
+    var n = N(state);
+    for (var k = 1; k <= n; k++) {
+      var s = (pid + k * state.direction + n * 2) % n;
+      if (P(state, s) && P(state, s).alive) return s;
+    }
+    return nextSeat(state, pid);
+  }
   function cardView(c) {
     if (!c) return null;
     var known = !!CARDS[c.id];
@@ -60,24 +68,28 @@
   }
   function nameOf(state, pid) { return P(state, pid).name || 'Player ' + (pid + 1); }
 
+  function makePlayer(i, name) {
+    return {
+      i: i, name: name || ('Player ' + (i + 1)),
+      tile: 1, alive: true, hand: [],
+      status: { skipTurns: 0, skipUntilRound: 0, needSix: false, nextCardType: null,
+                alphabeticalUntilRound: 0, extraRolls: 0, badImmuneRolls: 0,
+                nextCardGiveToNext: false, curseTile: null },
+      history: [1], prevTile: 1, lastRoll: 0, seq: 0, seqTurn: -1, drawnTypes: [], drewThisTurn: false
+    };
+  }
   function newGame(cfg) {
     cfg = cfg || {};
     var n = clamp(cfg.players || 2, 1, 4);
     var players = [];
     for (var i = 0; i < n; i++) {
-      players.push({
-        i: i, name: (cfg.names && cfg.names[i]) || ('Player ' + (i + 1)),
-        tile: 1, alive: true, hand: [],
-        status: { skipTurns: 0, skipUntilRound: 0, needSix: false, nextCardType: null,
-                  alphabeticalUntilRound: 0, extraRolls: 0, badImmuneRolls: 0,
-                  nextCardGiveToNext: false, curseTile: null },
-        history: [1], prevTile: 1, lastRoll: 0, seq: 0, seqTurn: -1, drawnTypes: [], drewThisTurn: false
-      });
+      players.push(makePlayer(i, (cfg.names && cfg.names[i]) || ('Player ' + (i + 1))));
     }
     return {
       version: 1,
       cfg: { players: n, exactFinish: cfg.exactFinish !== false, sequenceWin: cfg.sequenceWin !== false,
-             manualDice: !!cfg.manualDice, showMarkers: !!cfg.showMarkers, online: !!cfg.online },
+             manualDice: !!cfg.manualDice, showMarkers: !!cfg.showMarkers, online: !!cfg.online,
+             practiceBot: !!cfg.practiceBot },
       phase: 'lobby', gameover: false, winner: null, endReason: '',
       players: players,
       turnIndex: 0, direction: 1, turnCount: 0, round: 1,
@@ -85,7 +97,7 @@
       queue: [], reveal: null, prompt: null, lastCard: null,
       canEndTurn: false, rolledThisTurn: false, turnStartTile: 1,
       lastDieRaw: null, lastDie: null, jazzCue: false,
-      log: [], nextUid: 1, history: []
+      log: [], nextUid: 1, history: [], lastElimination: null
     };
   }
 
@@ -237,8 +249,10 @@
       log(state, 'The instant loss was blocked by VC25.');
       return;
     }
+    var handCount = p.hand.length;
     p.alive = false;
     returnHandToDeck(state, pid);
+    state.lastElimination = { pid: pid, name: nameOf(state, pid), reason: reason, tile: p.tile, handCount: handCount };
     log(state, nameOf(state, pid) + ' is out — ' + reason + '.');
     var alive = state.players.filter(function (q) { return q.alive; });
     if (alive.length === 1) win(state, alive[0].i, 'last player standing', false);
@@ -413,7 +427,7 @@
     }
     if (p.status.nextCardGiveToNext) {
       p.status.nextCardGiveToNext = false;
-      var tgt = nextSeat(state, pid);
+      var tgt = nextAliveSeat(state, pid);
       transferCard(state, pid, tgt, card);
       log(state, 'VC14: the card goes to ' + nameOf(state, tgt) + '; ' + nameOf(state, pid) + ' draws another.', id);
       enqueueDraw(state, pid, 1);
@@ -709,7 +723,7 @@
   function applyEffect(state, card, pid, fromPid) {
     if (state.gameover || !P(state, pid).alive) return;
     var id = card.id, p = P(state, pid), n = N(state);
-    var nxt = nextSeat(state, pid);
+    var nxt = nextAliveSeat(state, pid);
     var aliveCount = state.players.filter(function (q) { return q.alive; }).length;
     log(state, label(id) + ': ' + (CARDS[id] ? CARDS[id].text : 'engine effect'), id);
 
@@ -777,11 +791,13 @@
           [{ label: 'Take everyone’s Bad cards', value: 'bc24_take' }, { label: 'Move back four spaces', value: 'bc24_back' }]);
         break;
       case 'bc25': everyoneTo(state, 1); break;
-      case 'bc26':
-        setPrompt(state, { title: 'BC26 — the next player calls a card type', text: 'The next player in turn order says a card type out loud. If your next card is not that type, you go to the start.',
-          cardId: id, kind: 'options', multi: 0, data: { op: 'bc26_type', pid: pid },
+      case 'bc26': {
+        var bc26Next = nextAliveSeat(state, pid);
+        setPrompt(state, { title: 'BC26 — the next player calls a card type', text: 'Call a card type for ' + nameOf(state, pid) + '. If their next card is not that type, they go to the start.',
+          cardId: id, kind: 'options', multi: 0, forPid: bc26Next, data: { op: 'bc26_type', pid: pid, target: bc26Next },
           options: [{ label: 'Good', value: 'Good' }, { label: 'Bad', value: 'Bad' }, { label: 'Vertigo', value: 'Vertigo' }] });
         break;
+      }
       case 'bc27': p.status.nextCardType = { type: 'Bad', fail: 'lose' }; log(state, 'Your next card must be Bad, or you lose.'); break;
       case 'bc28': p.status.nextCardType = { type: 'Good', fail: 'lose' }; log(state, 'Your next card must be Good, or you lose.'); break;
       case 'bc29': p.status.nextCardType = { type: 'Vertigo', fail: 'lose' }; log(state, 'Your next card must be Vertigo, or you lose.'); break;
@@ -939,7 +955,7 @@
       case 'vc26': promptPlayers(state, { title: 'VC26 — swap hands', text: 'Choose a player. You may not look until you have their hand.', cardId: id, data: { op: 'vc26_target' } }); break;
       case 'vc27': log(state, 'Table call: insult another player.'); break;
       case 'vc28': log(state, 'Table call: compliment another player.'); break;
-      case 'vc29': state.flags.cubedUntilRound = state.round + 1; log(state, 'Every rolled number is cubed for a round.'); break;
+      case 'vc29': state.flags.cubedUntilRound = state.round + 1; log(state, 'Every rolled number is squared for a round.'); break;
       case 'vc30': {
         var counts = state.players.map(function (q) { return q.hand.length; });
         state.players.forEach(function (q) { q.hand.splice(0).forEach(function (c) { c.meta = {}; c.sticky = false; c.passive = false; c.playable = true; state.deck.push(c); }); });
@@ -966,6 +982,7 @@
     var p = cur(state);
     state.rolledThisTurn = false; p.drewThisTurn = false; state.canEndTurn = false;
     state.turnStartTile = p.tile;
+    state.lastElimination = null;
     log(state, '— Round ' + state.round + ' · ' + nameOf(state, p.i) + '’s turn (tile ' + p.tile + ') —');
   }
   function doRoll(state, action) {
@@ -974,7 +991,7 @@
     var raw = action && action.value != null && action.value !== '' ? clamp(Number(action.value) || 1, 1, 6) : d6();
     var die = raw;
     if (p.status.alphabeticalUntilRound >= state.round) die = ALPHA_MAP[raw] || raw;
-    if (state.flags.cubedUntilRound >= state.round) die = Math.pow(die, 3);
+    if (state.flags.cubedUntilRound >= state.round) die = Math.pow(die, 2);
     if (hasCard(state, p.i, 'bc14')) die = Math.max(0, die - 1);
     state.lastDieRaw = raw; state.lastDie = die;
     p.lastRoll = die;
@@ -1103,14 +1120,28 @@
     if (!action || !action.type) return state;
     var t = action.type;
     if (t === 'UNDO') return undo(state);
-    if (t === 'SET_NAME' && state.phase === 'lobby') {
+    if (t === 'SET_NAME' && state.phase === 'lobby' && state.players[action.pid]) {
       state.players[action.pid].name = String(action.name || '').slice(0, 24) || ('Player ' + (action.pid + 1));
       state.version++;
       return state;
     }
     if (t === 'START') { startGame(state); state.version++; return state; }
     if (t === 'SET_CONFIG') {
+      if (state.phase !== 'lobby' && action.cfg && action.cfg.players != null) return state;
       Object.assign(state.cfg, action.cfg || {});
+      var n = clamp(Number(state.cfg.players) || state.players.length, 1, 4);
+      state.cfg.players = n;
+      while (state.players.length > n) state.players.pop();
+      while (state.players.length < n) {
+        var idx = state.players.length;
+        state.players.push(makePlayer(idx, (state.cfg.names && state.cfg.names[idx]) || ('Player ' + (idx + 1))));
+      }
+      if (state.turnIndex >= state.players.length) state.turnIndex = 0;
+      state.version++;
+      return state;
+    }
+    if (t === 'ACK_ELIM') {
+      state.lastElimination = null;
       state.version++;
       return state;
     }
