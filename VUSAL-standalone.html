@@ -2123,7 +2123,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
         pushBanner(state, { kind: 'card', cardId: card910, cards: sent910.map(cardView), private: true,
           title: label(card910) + ' — CARDS RECEIVED',
           text: nameOf(state, pid) + ' gave ' + sent910.map(function (c) { return label(c.id); }).join(' & ') + ' to ' + nameOf(state, value) + '.',
-          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+          actor: pid, pendingPids: [value] });
         break;
       }
       case 'bc11_target':
@@ -2205,7 +2205,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
         pushBanner(state, { kind: 'card', cardId: 'vc1', card: cardView(c1), private: true,
           title: 'VC1 — CARD RECEIVED',
           text: nameOf(state, pid) + ' gave ' + label(c1.id) + ' to ' + nameOf(state, pr.data.target) + '.',
-          actor: pid, pendingPids: [state.cfg.practiceBot && pr.data.target > 0 ? 0 : pr.data.target] });
+          actor: pid, pendingPids: [pr.data.target] });
         break;
       }
       case 'vc6_target': {
@@ -2250,7 +2250,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
         pushBanner(state, { kind: 'card', cardId: 'vc26', cards: hA.map(cardView), private: true,
           title: 'VC26 — HANDS SWAPPED',
           text: nameOf(state, pid) + ' swapped hands with ' + nameOf(state, value) + '. Received ' + hA.length + ' card(s).',
-          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+          actor: pid, pendingPids: (state.cfg.practiceBot && pid === 0 && value > 0) ? [0, value] : [value] });
         break;
       }
       case 'vc31_target':
@@ -2563,7 +2563,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
         pushBanner(state, { kind: 'card', cardId: 'gc29', card: cardView(stolen), private: true,
           title: 'GC29 — CARD STOLEN',
           text: nameOf(state, pid) + ' stole ' + label(stolen.id) + ' from ' + nameOf(state, nxt) + '.',
-          actor: pid, pendingPids: state.cfg.practiceBot ? [0] : (nxt !== pid ? [nxt, pid] : [pid]) });
+          actor: pid, pendingPids: nxt !== pid ? [nxt, pid] : [pid] });
         transferCard(state, nxt, pid, stolen);
         break;
       }
@@ -2899,7 +2899,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
       pushBanner(state, { kind: 'card', cardId: 'vc22', card: cardView(card), private: true,
         title: 'VC22 — CARD SNATCHED',
         text: nameOf(state, thief) + ' snatched ' + label(card.id) + ' from ' + nameOf(state, pid) + ' the moment it was played.',
-        actor: thief, pendingPids: state.cfg.practiceBot ? [0] : [pid, thief] });
+        actor: thief, pendingPids: [pid, thief] });
       transferCard(state, pid, thief, card);
       return;
     }
@@ -2925,14 +2925,23 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
     if (!state.banners) state.banners = [];
     if (!state.milestones) state.milestones = [];
     var t = action.type;
-    if (t === 'UNDO') return undo(state);
-    if (t === 'SET_NAME' && state.phase === 'lobby' && state.players[action.pid]) {
-      state.players[action.pid].name = String(action.name || '').slice(0, 24) || ('Player ' + (action.pid + 1));
-      state.version++;
+    if (t === 'UNDO') {
+      if (action.seat != null && action.seat !== 0) return state;
+      return undo(state);
+    }
+    if (t === 'SET_NAME') {
+      if (state.phase === 'lobby' && state.players[action.pid] && !(action.seat != null && action.pid !== action.seat)) {
+        state.players[action.pid].name = String(action.name || '').slice(0, 24) || ('Player ' + (action.pid + 1));
+        state.version++;
+      }
       return state;
     }
-    if (t === 'START') { startGame(state); state.version++; return state; }
+    if (t === 'START') {
+      if (action.seat != null && action.seat !== 0) return state;
+      startGame(state); state.version++; return state;
+    }
     if (t === 'SET_CONFIG') {
+      if (action.seat != null && action.seat !== 0) return state;
       if (state.phase !== 'lobby' && action.cfg && action.cfg.players != null) return state;
       Object.assign(state.cfg, action.cfg || {});
       var n = clamp(Number(state.cfg.players) || state.players.length, 1, 4);
@@ -2969,8 +2978,10 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
     if (t === 'ACK_ELIM') {
       if (state.banners.length && state.banners[0].kind === 'out') {
         var ob = state.banners[0];
-        if (action.seat != null && ob.pendingPids.indexOf(action.seat) >= 0) {
-          ob.pendingPids.splice(ob.pendingPids.indexOf(action.seat), 1);
+        if (action.seat != null) {
+          var epos = ob.pendingPids.indexOf(action.seat);
+          if (epos < 0) return state;
+          ob.pendingPids.splice(epos, 1);
         } else {
           ob.pendingPids.length = 0;
         }
@@ -3641,7 +3652,9 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
     go('game');
   }
   function hasBlockingBanner(s) {
-    return !!(s && s.banners && s.banners.length);
+    if (!s || !s.banners || !s.banners.length) return false;
+    var b = s.banners[0];
+    return !b.pendingPids || b.pendingPids.indexOf(0) >= 0;
   }
   function maybeBotTurn() {
     if (ui.botBusy || !ui.practiceBot || ui.mode !== 'local' || ui.screen !== 'game' || !ui.localState) return;
@@ -3665,18 +3678,20 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
     if (actorSeat <= 0 || !p) { ui.botBusy = false; return; }
 
     if (v.reveal) {
-      act({ type: 'ACK' }, true);
+      act({ type: 'ACK', seat: actorSeat }, true);
+    } else if (v.banners && v.banners.length) {
+      act({ type: 'ACK_BANNER', seat: actorSeat }, true);
     } else if (v.prompt) {
-      botAnswer();
+      botAnswer(actorSeat);
     } else if (!p.alive) {
-      if (v.canEndTurn) act({ type: 'END_TURN' }, true);
+      if (v.canEndTurn) act({ type: 'END_TURN', seat: actorSeat }, true);
       else { ui.botBusy = false; return; }
     } else if (!v.rolledThisTurn) {
-      act({ type: 'ROLL' }, true);
+      act({ type: 'ROLL', seat: actorSeat }, true);
     } else if (v.canEndTurn) {
       var card = (p.hand || []).find(function (c) { return !c.sticky && !c.passive && c.playable !== false; });
-      if (card) act({ type: 'PLAY_CARD', uid: card.uid }, true);
-      else act({ type: 'END_TURN' }, true);
+      if (card) act({ type: 'PLAY_CARD', uid: card.uid, seat: actorSeat }, true);
+      else act({ type: 'END_TURN', seat: actorSeat }, true);
     } else {
       ui.botBusy = false;
       return;
@@ -3686,12 +3701,12 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
       maybeBotTurn();
     }, 600);
   }
-  function botAnswer() {
+  function botAnswer(actorSeat) {
     if (!ui.practiceBot || !ui.localState || !ui.localState.prompt) return;
     var opts = ui.localState.prompt.options || [];
     var pick = opts.find(function (o) { return !o.disabled; });
     if (pick == null) return;
-    act({ type: 'ANSWER', value: pick.value }, true);
+    act({ type: 'ANSWER', value: pick.value, seat: actorSeat }, true);
   }
   function saveLocal() {
     if (!ui.localState) return;
@@ -3891,6 +3906,9 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
       ui.highlightedCite = null;
     }
     if (ui.mode === 'local') {
+      if (ui.practiceBot && !fromBot && action && action.seat == null && action.type && action.type.indexOf('DM_') !== 0 && action.type !== 'UNDO') {
+        action = Object.assign({ seat: 0 }, action);
+      }
       E.apply(ui.localState, action);
       saveLocal();
       render();
@@ -3909,7 +3927,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
   function currentView() {
     if (ui.mode === 'local') {
       if (!ui.localState) return null;
-      return E.view(ui.localState, focusSeat());
+      return E.view(ui.localState, ui.practiceBot ? 0 : focusSeat());
     }
     if (ui.mode === 'online') return online.state;
     return null;
@@ -4164,8 +4182,10 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
         h += '<div class="muted" style="font-size:10px;letter-spacing:.12em;margin-bottom:6px">OR ENTER YOUR OWN ROLL</div><div class="manual">' +
           [1, 2, 3, 4, 5, 6].map(function (n) { return '<button data-manual="' + n + '">' + n + '</button>'; }).join('') + '</div>';
       }
-    } else if (v.canEndTurn) h += '<button class="bigbtn" data-end>END TURN</button><button class="bigbtn secondary" data-undo>UNDO LAST ACTION</button>';
-    else h += '<div class="waiting-note">Resolving…</div>';
+    } else if (v.canEndTurn) {
+      h += '<button class="bigbtn" data-end>END TURN</button>';
+      if (ui.mode === 'local' || online.seat === 0) h += '<button class="bigbtn secondary" data-undo>UNDO LAST ACTION</button>';
+    } else h += '<div class="waiting-note">Resolving…</div>';
     $('#turnPanel').innerHTML = h;
   }
   function renderPlayers(v) {
@@ -4252,7 +4272,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
       '<button data-dm="clear">CLEAR RULES</button><button data-dm="end">FORCE END TURN</button>' +
       '</div><button class="dm-wide" data-dm="undo">UNDO LAST ACTION</button>' +
       (v.banner ? '<button class="dm-wide" data-dm="skipbanner">SKIP ACTIVE BANNER</button>' : '') +
-      '<button class="dm-wide" data-dm="privacy">PASS-THE-DEVICE SCREENS: ' + (ui.noPrivacy ? 'OFF' : 'ON') + '</button>' +
+      (ui.mode === 'local' && !ui.practiceBot ? '<button class="dm-wide" data-dm="privacy">PASS-THE-DEVICE SCREENS: ' + (ui.noPrivacy ? 'OFF' : 'ON') + '</button>' : '') +
       '<button class="dm-wide" data-dm="new">' + (ui.mode === 'online' ? 'RESET ROOM (HOST)' : 'NEW GAME') + '</button>';
     h += '<p class="muted" style="font-size:10px;margin:8px 0 0">The table has the final say on anything the engine cannot judge.</p>';
     $('#dmControls').innerHTML = h;
@@ -4457,8 +4477,8 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
   function renderOverlay(v) {
     var ov = $('#overlay');
     if (!v) { ov.hidden = true; ov.innerHTML = ''; ov.classList.remove('passive', 'privacy-screen'); return; }
-    if (ui.mode === 'local' && (ui.noPrivacy || v.phase === 'gameover')) ui.privacySeat = focusSeat();
-    var needPrivacy = (ui.mode === 'local' && !ui.noPrivacy && v.phase !== 'gameover' && ui.privacySeat !== focusSeat());
+    if (ui.mode === 'local' && (ui.noPrivacy || ui.practiceBot || v.phase === 'gameover')) ui.privacySeat = focusSeat();
+    var needPrivacy = (ui.mode === 'local' && !ui.noPrivacy && !ui.practiceBot && v.phase !== 'gameover' && ui.privacySeat !== focusSeat());
 
     // Keep search input focus alive while updating the Log Modal during polls/searches.
     if (ui.logModalOpen && !needPrivacy && !(v.banner && v.banner.kind === 'out') && ov.querySelector('#logModalSearch') && ov.querySelector('#logModalList')) {
@@ -4638,6 +4658,7 @@ body.light .card-banner.alert .cb-kicker{color:#8b1a1a}
     $('#handPanel').addEventListener('click', function (e) {
       var b = e.target.closest('[data-card]'); if (!b) return;
       var v = currentView(); if (!v || !v.you) return;
+      if (ui.practiceBot && v.yourSeat !== v.turnIndex) { toast('WAIT FOR YOUR TURN'); return; }
       var c = v.you.hand.find(function (x) { return x.uid === Number(b.dataset.card); });
       if (c) { ui.confirmCard = c; renderOverlay(v); }
     });

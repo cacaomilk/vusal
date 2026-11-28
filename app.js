@@ -245,7 +245,9 @@
     go('game');
   }
   function hasBlockingBanner(s) {
-    return !!(s && s.banners && s.banners.length);
+    if (!s || !s.banners || !s.banners.length) return false;
+    var b = s.banners[0];
+    return !b.pendingPids || b.pendingPids.indexOf(0) >= 0;
   }
   function maybeBotTurn() {
     if (ui.botBusy || !ui.practiceBot || ui.mode !== 'local' || ui.screen !== 'game' || !ui.localState) return;
@@ -269,18 +271,20 @@
     if (actorSeat <= 0 || !p) { ui.botBusy = false; return; }
 
     if (v.reveal) {
-      act({ type: 'ACK' }, true);
+      act({ type: 'ACK', seat: actorSeat }, true);
+    } else if (v.banners && v.banners.length) {
+      act({ type: 'ACK_BANNER', seat: actorSeat }, true);
     } else if (v.prompt) {
-      botAnswer();
+      botAnswer(actorSeat);
     } else if (!p.alive) {
-      if (v.canEndTurn) act({ type: 'END_TURN' }, true);
+      if (v.canEndTurn) act({ type: 'END_TURN', seat: actorSeat }, true);
       else { ui.botBusy = false; return; }
     } else if (!v.rolledThisTurn) {
-      act({ type: 'ROLL' }, true);
+      act({ type: 'ROLL', seat: actorSeat }, true);
     } else if (v.canEndTurn) {
       var card = (p.hand || []).find(function (c) { return !c.sticky && !c.passive && c.playable !== false; });
-      if (card) act({ type: 'PLAY_CARD', uid: card.uid }, true);
-      else act({ type: 'END_TURN' }, true);
+      if (card) act({ type: 'PLAY_CARD', uid: card.uid, seat: actorSeat }, true);
+      else act({ type: 'END_TURN', seat: actorSeat }, true);
     } else {
       ui.botBusy = false;
       return;
@@ -290,12 +294,12 @@
       maybeBotTurn();
     }, 600);
   }
-  function botAnswer() {
+  function botAnswer(actorSeat) {
     if (!ui.practiceBot || !ui.localState || !ui.localState.prompt) return;
     var opts = ui.localState.prompt.options || [];
     var pick = opts.find(function (o) { return !o.disabled; });
     if (pick == null) return;
-    act({ type: 'ANSWER', value: pick.value }, true);
+    act({ type: 'ANSWER', value: pick.value, seat: actorSeat }, true);
   }
   function saveLocal() {
     if (!ui.localState) return;
@@ -495,6 +499,9 @@
       ui.highlightedCite = null;
     }
     if (ui.mode === 'local') {
+      if (ui.practiceBot && !fromBot && action && action.seat == null && action.type && action.type.indexOf('DM_') !== 0 && action.type !== 'UNDO') {
+        action = Object.assign({ seat: 0 }, action);
+      }
       E.apply(ui.localState, action);
       saveLocal();
       render();
@@ -513,7 +520,7 @@
   function currentView() {
     if (ui.mode === 'local') {
       if (!ui.localState) return null;
-      return E.view(ui.localState, focusSeat());
+      return E.view(ui.localState, ui.practiceBot ? 0 : focusSeat());
     }
     if (ui.mode === 'online') return online.state;
     return null;
@@ -768,8 +775,10 @@
         h += '<div class="muted" style="font-size:10px;letter-spacing:.12em;margin-bottom:6px">OR ENTER YOUR OWN ROLL</div><div class="manual">' +
           [1, 2, 3, 4, 5, 6].map(function (n) { return '<button data-manual="' + n + '">' + n + '</button>'; }).join('') + '</div>';
       }
-    } else if (v.canEndTurn) h += '<button class="bigbtn" data-end>END TURN</button><button class="bigbtn secondary" data-undo>UNDO LAST ACTION</button>';
-    else h += '<div class="waiting-note">Resolving…</div>';
+    } else if (v.canEndTurn) {
+      h += '<button class="bigbtn" data-end>END TURN</button>';
+      if (ui.mode === 'local' || online.seat === 0) h += '<button class="bigbtn secondary" data-undo>UNDO LAST ACTION</button>';
+    } else h += '<div class="waiting-note">Resolving…</div>';
     $('#turnPanel').innerHTML = h;
   }
   function renderPlayers(v) {
@@ -856,7 +865,7 @@
       '<button data-dm="clear">CLEAR RULES</button><button data-dm="end">FORCE END TURN</button>' +
       '</div><button class="dm-wide" data-dm="undo">UNDO LAST ACTION</button>' +
       (v.banner ? '<button class="dm-wide" data-dm="skipbanner">SKIP ACTIVE BANNER</button>' : '') +
-      '<button class="dm-wide" data-dm="privacy">PASS-THE-DEVICE SCREENS: ' + (ui.noPrivacy ? 'OFF' : 'ON') + '</button>' +
+      (ui.mode === 'local' && !ui.practiceBot ? '<button class="dm-wide" data-dm="privacy">PASS-THE-DEVICE SCREENS: ' + (ui.noPrivacy ? 'OFF' : 'ON') + '</button>' : '') +
       '<button class="dm-wide" data-dm="new">' + (ui.mode === 'online' ? 'RESET ROOM (HOST)' : 'NEW GAME') + '</button>';
     h += '<p class="muted" style="font-size:10px;margin:8px 0 0">The table has the final say on anything the engine cannot judge.</p>';
     $('#dmControls').innerHTML = h;
@@ -1061,8 +1070,8 @@
   function renderOverlay(v) {
     var ov = $('#overlay');
     if (!v) { ov.hidden = true; ov.innerHTML = ''; ov.classList.remove('passive', 'privacy-screen'); return; }
-    if (ui.mode === 'local' && (ui.noPrivacy || v.phase === 'gameover')) ui.privacySeat = focusSeat();
-    var needPrivacy = (ui.mode === 'local' && !ui.noPrivacy && v.phase !== 'gameover' && ui.privacySeat !== focusSeat());
+    if (ui.mode === 'local' && (ui.noPrivacy || ui.practiceBot || v.phase === 'gameover')) ui.privacySeat = focusSeat();
+    var needPrivacy = (ui.mode === 'local' && !ui.noPrivacy && !ui.practiceBot && v.phase !== 'gameover' && ui.privacySeat !== focusSeat());
 
     // Keep search input focus alive while updating the Log Modal during polls/searches.
     if (ui.logModalOpen && !needPrivacy && !(v.banner && v.banner.kind === 'out') && ov.querySelector('#logModalSearch') && ov.querySelector('#logModalList')) {
@@ -1242,6 +1251,7 @@
     $('#handPanel').addEventListener('click', function (e) {
       var b = e.target.closest('[data-card]'); if (!b) return;
       var v = currentView(); if (!v || !v.you) return;
+      if (ui.practiceBot && v.yourSeat !== v.turnIndex) { toast('WAIT FOR YOUR TURN'); return; }
       var c = v.you.hand.find(function (x) { return x.uid === Number(b.dataset.card); });
       if (c) { ui.confirmCard = c; renderOverlay(v); }
     });
