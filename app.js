@@ -14,7 +14,8 @@
   var ui = {
     screen: 'setup', mode: 'menu', localState: null, privacySeat: null,
     confirmCard: null, localPlayers: 2, onlinePlayers: 4,
-    cardFilter: 'All', cardQuery: '', light: false, noPrivacy: false, toastTimer: null
+    cardFilter: 'All', cardQuery: '', light: false, noPrivacy: false, toastTimer: null,
+    prevState: null, practiceBot: false, botBusy: false, botTimer: null
   };
   var online = { code: '', seat: 0, token: '', version: 0, state: null };
   var pollGeneration = 0;
@@ -65,9 +66,27 @@
     } catch (e) {}
   }
   function toast(msg) {
-    var t = $('#toast'); t.textContent = msg; t.hidden = false;
+    var t = $('#toast');
+    t.style.background = 'var(--ink)';
+    t.style.color = 'var(--paper)';
+    t.textContent = msg;
+    t.hidden = false;
     clearTimeout(ui.toastTimer);
     ui.toastTimer = setTimeout(function () { t.hidden = true; }, 1900);
+  }
+  function cardToast(kind, id, text, actor) {
+    var t = $('#toast');
+    var badge = kind === 'draw' ? 'DREW' : kind === 'play' ? 'PLAYED' : kind === 'effect' ? 'EFFECT ON YOU' : 'CARD';
+    t.textContent = (actor ? actor + ' · ' : '') + badge + (id ? ' ' + id : '') + (text ? ' — ' + text : '');
+    t.style.background = kind === 'effect' ? '#8b1a1a' : 'var(--ink)';
+    t.style.color = kind === 'effect' ? '#ffffff' : 'var(--paper)';
+    t.hidden = false;
+    clearTimeout(ui.toastTimer);
+    ui.toastTimer = setTimeout(function () {
+      t.hidden = true;
+      t.style.background = 'var(--ink)';
+      t.style.color = 'var(--paper)';
+    }, 3200);
   }
 
   /* ---------------- navigation ---------------- */
@@ -91,7 +110,9 @@
         ui.confirmCard = null;
         $('#mobileBar').hidden = true;
       }
-      $('#modeBadge').textContent = ui.mode === 'local' ? 'PASS & PLAY' : ui.mode === 'online' ? 'ROOM ' + online.code + ' · SEAT ' + (online.seat + 1) : 'NO GAME';
+      $('#modeBadge').textContent = ui.mode === 'local'
+        ? (ui.practiceBot ? 'PRACTICE' : 'PASS & PLAY')
+        : (ui.mode === 'online' ? 'ROOM ' + online.code + ' · SEAT ' + (online.seat + 1) : 'NO GAME');
       if (ui.screen === 'setup') renderMenu();
       if (ui.screen === 'game') renderGame();
       if (ui.screen === 'cards') renderCards();
@@ -117,22 +138,33 @@
     var b = $(sel + ' button.on');
     return b ? Number(b.dataset.n) : 2;
   }
+  function stopBots() {
+    clearTimeout(ui.botTimer);
+    ui.botTimer = null;
+    ui.botBusy = false;
+  }
   function startLocal(resume) {
+    stopBots();
+    ui.prevState = null;
     if (resume) {
       try {
         var raw = localStorage.getItem('vusal.local');
         if (!raw) return;
         ui.localState = JSON.parse(raw);
         ui.localState.history = [];
+        ui.practiceBot = !!(ui.localState.cfg && ui.localState.cfg.practiceBot);
+        if (ui.practiceBot) ui.noPrivacy = true;
       } catch (e) { toast('SAVED GAME UNREADABLE'); return; }
     } else {
       var names = $$('.localName').map(function (i) { return i.value.trim(); });
       var cfg = {
         players: ui.localPlayers, names: names,
         manualDice: $('#optManual').checked, exactFinish: $('#optExact').checked,
-        sequenceWin: $('#optSequence').checked, showMarkers: $('#optMarkers').checked
+        sequenceWin: $('#optSequence').checked, showMarkers: $('#optMarkers').checked,
+        practiceBot: false
       };
       ui.noPrivacy = $('#optPrivacy').checked;
+      ui.practiceBot = false;
       savePrefs();
       ui.localState = E.newGame(cfg);
       E.apply(ui.localState, { type: 'START' });
@@ -142,6 +174,80 @@
     ui.confirmCard = null;
     saveLocal();
     go('game');
+  }
+  function startPractice() {
+    stopBots();
+    ui.prevState = null;
+    var name = $('#practiceName').value.trim() || 'Player 1';
+    var nBots = selectedPlayers('#practiceBots');
+    var totalPlayers = 1 + nBots;
+    var names = [name];
+    for (var i = 1; i <= nBots; i++) names.push('Bot ' + (i + 1));
+    var cfg = {
+      players: totalPlayers, names: names,
+      manualDice: false, exactFinish: $('#optPracticeExact').checked,
+      sequenceWin: $('#optPracticeSequence').checked, showMarkers: $('#optPracticeMarkers').checked,
+      practiceBot: true
+    };
+    ui.localState = E.newGame(cfg);
+    E.apply(ui.localState, { type: 'START' });
+    ui.mode = 'local';
+    ui.privacySeat = null;
+    ui.noPrivacy = true;
+    ui.confirmCard = null;
+    ui.practiceBot = true;
+    saveLocal();
+    go('game');
+  }
+  function maybeBotTurn() {
+    if (ui.botBusy || !ui.practiceBot || ui.mode !== 'local' || ui.screen !== 'game' || !ui.localState) return;
+    var v = ui.localState;
+    if (v.phase !== 'turn' || v.gameover || v.lastElimination || ui.confirmCard) return;
+    var actorSeat = focusSeat();
+    if (actorSeat <= 0 || !v.players[actorSeat]) return;
+    ui.botBusy = true;
+    ui.botTimer = setTimeout(botAct, 800);
+  }
+  function botAct() {
+    if (!ui.practiceBot || ui.mode !== 'local' || ui.screen !== 'game' || !ui.localState) {
+      ui.botBusy = false; return;
+    }
+    var v = ui.localState;
+    if (v.phase !== 'turn' || v.gameover || v.lastElimination || ui.confirmCard) {
+      ui.botBusy = false; return;
+    }
+    var actorSeat = focusSeat();
+    var p = v.players[actorSeat];
+    if (actorSeat <= 0 || !p) { ui.botBusy = false; return; }
+
+    if (v.reveal) {
+      act({ type: 'ACK' });
+    } else if (v.prompt) {
+      botAnswer();
+    } else if (!p.alive) {
+      if (v.canEndTurn) act({ type: 'END_TURN' });
+      else { ui.botBusy = false; return; }
+    } else if (!v.rolledThisTurn) {
+      act({ type: 'ROLL' });
+    } else if (v.canEndTurn) {
+      var card = (p.hand || []).find(function (c) { return !c.sticky && !c.passive && c.playable !== false; });
+      if (card) act({ type: 'PLAY_CARD', uid: card.uid });
+      else act({ type: 'END_TURN' });
+    } else {
+      ui.botBusy = false;
+      return;
+    }
+    ui.botTimer = setTimeout(function () {
+      ui.botBusy = false;
+      maybeBotTurn();
+    }, 600);
+  }
+  function botAnswer() {
+    if (!ui.practiceBot || !ui.localState || !ui.localState.prompt) return;
+    var opts = ui.localState.prompt.options || [];
+    var pick = opts.find(function (o) { return !o.disabled; });
+    if (pick == null) return;
+    act({ type: 'ANSWER', value: pick.value });
   }
   function saveLocal() {
     if (!ui.localState) return;
@@ -153,6 +259,22 @@
   }
 
   /* ---------------- online rooms ---------------- */
+  function exitOnlineToMenu(errMsg) {
+    pollGeneration++;
+    online = { code: '', seat: 0, token: '', version: 0, state: null };
+    ui.mode = 'menu';
+    ui.screen = 'setup';
+    ui.prevState = null;
+    $('#onlineForms').hidden = false;
+    $('#roomCard').hidden = true;
+    setRoomQuery('');
+    renderShareLine();
+    if (errMsg) {
+      $('#onlineError').textContent = errMsg;
+      toast(errMsg);
+    }
+    render();
+  }
   function renderRoomCard() {
     if (!online.state) return;
     $('#onlineForms').hidden = true;
@@ -160,14 +282,19 @@
     $('#roomCodeText').textContent = online.code;
     var v = online.state;
     var you = v.players[online.seat];
-    $('#roomSeatLine').textContent = 'You are seat ' + (online.seat + 1) + ' (' + esc(you ? you.name : '') + '). Share the game link or the room code.';
+    $('#roomSeatLine').textContent = 'You are seat ' + (online.seat + 1) + ' (' + (you ? you.name : '') + '). Share the game link or the room code.';
     var rl = $('#roomLinkText');
     if (rl) { rl.hidden = !isHosted(); rl.textContent = isHosted() ? linkFor(online.code) : ''; }
     var taken = v.takenSeats || [];
     var seatsFull = v.players.every(function (p) { return taken.indexOf(p.i) >= 0; });
+    var isHost = online.seat === 0;
+    $('#partySizeLabel').style.display = isHost ? 'block' : 'none';
+    var curN = v.players.length;
+    $$('#partySize button').forEach(function (b) { b.classList.toggle('on', Number(b.dataset.n) === curN); });
     $('#roomSeats').innerHTML = v.players.map(function (p) {
       var tag = p.i === online.seat ? 'YOU' : (p.i === 0 ? 'HOST' : (taken.indexOf(p.i) >= 0 ? 'JOINED' : 'OPEN'));
-      return '<li><b>' + (p.i + 1) + '</b><span>' + esc(p.name) + '</span><em>' + tag + '</em></li>';
+      var kick = isHost && p.i !== online.seat && p.i !== 0 && taken.indexOf(p.i) >= 0 ? '<button class="kick" data-kick="' + p.i + '">KICK</button>' : '';
+      return '<li><b>' + (p.i + 1) + '</b><span>' + esc(p.name) + '</span><em>' + tag + '</em>' + kick + '</li>';
     }).join('');
     $('#startOnline').hidden = online.seat !== 0 || !seatsFull;
   }
@@ -209,6 +336,9 @@
     return r.json();
   }
   async function createRoom() {
+    stopBots();
+    ui.practiceBot = false;
+    ui.prevState = null;
     $('#onlineError').textContent = '';
     var name = $('#createName').value.trim() || 'Player 1';
     ui.onlinePlayers = selectedPlayers('#onlinePlayers');
@@ -225,6 +355,9 @@
     } catch (e) { $('#onlineError').textContent = 'Could not reach the server.'; }
   }
   async function joinRoom() {
+    stopBots();
+    ui.practiceBot = false;
+    ui.prevState = null;
     $('#onlineError').textContent = '';
     var code = $('#joinCode').value.trim().toUpperCase();
     var name = $('#joinName').value.trim() || 'Player';
@@ -250,7 +383,15 @@
           var r = await fetch('/api/rooms/' + code + '/state?seat=' + seat + '&token=' + token + '&version=' + requestVersion);
           var d = await r.json();
           if (gen !== pollGeneration || ui.mode !== 'online' || online.code !== code || online.seat !== seat || online.token !== token) continue;
-          if (d.error) { $('#onlineError').textContent = d.error; break; }
+          if (d.error) {
+            var msg = r.status === 401 ? 'You were removed from the room.' : d.error;
+            exitOnlineToMenu(msg);
+            break;
+          }
+          if (d.state && d.state.phase === 'lobby' && d.state.takenSeats && d.state.takenSeats.indexOf(seat) < 0) {
+            exitOnlineToMenu('You were removed from the room.');
+            break;
+          }
           if (!online.state || (d.version >= requestVersion && d.version >= online.version)) {
             online.version = d.version; online.state = d.state;
             if (ui.screen === 'setup' && d.state.phase === 'lobby') renderRoomCard();
@@ -275,13 +416,13 @@
     } catch (e) { toast('CONNECTION ISSUE — RETRYING'); }
   }
   function leaveRoom() {
-    pollGeneration++;
+    stopBots();
     if (online.token) api('/api/rooms/' + online.code + '/leave', { seat: online.seat, token: online.token }).catch(function () {});
-    online = { code: '', seat: 0, token: '', version: 0, state: null };
-    ui.mode = 'menu'; ui.screen = 'setup';
-    $('#onlineForms').hidden = false; $('#roomCard').hidden = true;
-    setRoomQuery(''); renderShareLine();
-    render();
+    exitOnlineToMenu('');
+  }
+  function kickPlayer(kickSeat) {
+    if (!online.token) return;
+    postAction({ type: 'KICK', seatToKick: kickSeat });
   }
 
   /* ---------------- actions ---------------- */
@@ -326,10 +467,139 @@
     renderPlayers(v);
     renderHand(v);
     renderDeck(v);
+    renderCardActivity(v);
     renderDM(v);
     renderLog(v);
     renderOverlay(v);
     renderMobileBar(v);
+    checkCardActivity(v);
+    if (ui.practiceBot && ui.mode === 'local' && ui.localState && ui.localState.phase === 'turn' && !ui.localState.gameover) maybeBotTurn();
+  }
+  function checkCardActivity(v) {
+    if (!v || (ui.mode !== 'online' && !ui.practiceBot)) { ui.prevState = null; return; }
+    if (v.phase === 'lobby') { ui.prevState = cloneView(v); return; }
+    var prev = ui.prevState;
+    if (!prev || v.version < prev.version || (v.turnCount === 0 && v.discardCount === 0 && prev.discardCount > 0)) {
+      ui.prevState = cloneView(v);
+      return;
+    }
+
+    var newLogs = (v.log || []).filter(function (l) { return l.n > prev.lastLogN; });
+    var actor = findActorByChange(v, prev, newLogs);
+    var mySeat = ui.mode === 'online' ? v.yourSeat : 0;
+    var curYou = v.players[mySeat] || null;
+    var prevYou = prev.players ? prev.players[mySeat] : null;
+    var actedByOther = actor ? actor.i !== mySeat : prev.turnIndex !== mySeat;
+
+    var addedStatuses = [];
+    if (curYou && prevYou) {
+      (curYou.statuses || []).forEach(function (st) {
+        if ((prevYou.statuses || []).indexOf(st) < 0) addedStatuses.push(st);
+      });
+    }
+    var eliminatedMe = !!(curYou && prevYou && prevYou.alive && !curYou.alive);
+    var lostCardsFromOther = !!(curYou && prevYou && actedByOther && curYou.handCount < prevYou.handCount);
+    var movedByOther = !!(curYou && prevYou && actedByOther && curYou.tile !== prevYou.tile);
+    var movedBackByCard = !!(curYou && prevYou && v.discardCount > prev.discardCount && curYou.tile < prevYou.tile && (!actor || actor.i === mySeat));
+    var badStatusHit = addedStatuses.some(function (st) {
+      return st !== 'POINT NEMO' && st.indexOf('3→7→13') !== 0 && st !== 'SNAKE IMMUNE' && st !== 'LOSE-PROOF';
+    }) && (actedByOther || v.discardCount > prev.discardCount);
+
+    var effectReason = '';
+    if (eliminatedMe) {
+      effectReason = (v.lastElimination && v.lastElimination.pid === mySeat && v.lastElimination.reason) || 'You were eliminated.';
+    } else if (movedByOther) {
+      effectReason = 'Moved from tile ' + prevYou.tile + ' to tile ' + curYou.tile + '.';
+    } else if (lostCardsFromOther) {
+      effectReason = 'Lost ' + (prevYou.handCount - curYou.handCount) + ' card(s) from your hand.';
+    } else if (badStatusHit) {
+      effectReason = addedStatuses[0];
+    } else if (movedBackByCard && v.discardTop) {
+      effectReason = v.discardTop.text;
+    }
+
+    if (effectReason) {
+      var effCard = v.discardCount > prev.discardCount && v.discardTop
+        ? v.discardTop.id.toUpperCase()
+        : findLastCardId(newLogs) || 'CARD';
+      var logDetail = findReasonLog(newLogs);
+      var msg = logDetail && v.discardTop && v.discardTop.text ? v.discardTop.text + ' (' + effectReason + ')' : (logDetail || effectReason);
+      cardToast('effect', effCard, msg, actor ? actor.name : '');
+    } else if (v.discardCount > prev.discardCount && v.discardTop) {
+      var last = v.discardTop;
+      cardToast('play', last.id.toUpperCase(), last.text, actor ? actor.name : '');
+    } else if (v.reveal && (!prev.reveal || prev.reveal.uid !== v.reveal.card.uid || prev.reveal.pid !== v.reveal.pid)) {
+      var drawer = v.players[v.reveal.pid];
+      cardToast('draw', v.reveal.card.id.toUpperCase(), v.reveal.card.text, v.reveal.pid === mySeat ? 'You' : (drawer ? drawer.name : ''));
+    } else if (v.waiting && v.waiting.kind === 'reveal' && (!prev.waiting || prev.waiting.pid !== v.waiting.pid || prev.waiting.kind !== 'reveal')) {
+      cardToast('draw', 'CARD', 'drew a secret card', v.waiting.name);
+    } else if (curYou && prevYou && curYou.handCount > prevYou.handCount) {
+      var drawn = curYou.handCount - prevYou.handCount;
+      cardToast('draw', 'CARD', 'drew ' + drawn + ' card' + (drawn > 1 ? 's' : ''), 'You');
+    } else {
+      var otherGained = (v.players || []).find(function (p) {
+        var pp = prev.players ? prev.players[p.i] : null;
+        return pp && p.i !== mySeat && p.handCount > pp.handCount;
+      });
+      if (otherGained) {
+        var d2 = otherGained.handCount - prev.players[otherGained.i].handCount;
+        cardToast('draw', 'CARD', 'drew ' + d2 + ' card' + (d2 > 1 ? 's' : ''), otherGained.name);
+      } else {
+        var elim = (v.players || []).find(function (p) {
+          var pp = prev.players ? prev.players[p.i] : null;
+          return pp && pp.alive && !p.alive;
+        });
+        if (elim) cardToast('effect', 'OUT', elim.name + ' is out.', elim.name);
+      }
+    }
+
+    ui.prevState = cloneView(v);
+  }
+  function cloneView(v) {
+    if (!v) return null;
+    var logs = v.log || [];
+    return {
+      version: v.version || 0,
+      turnIndex: v.turnIndex,
+      discardCount: v.discardCount,
+      discardTop: v.discardTop,
+      lastLogN: logs.length ? logs[logs.length - 1].n : 0,
+      reveal: v.reveal ? { uid: v.reveal.card.uid, pid: v.reveal.pid } : null,
+      waiting: v.waiting ? { kind: v.waiting.kind, pid: v.waiting.pid } : null,
+      you: v.you ? { handCount: v.you.handCount } : null,
+      players: (v.players || []).map(function (p) {
+        return { i: p.i, name: p.name, tile: p.tile, alive: p.alive, handCount: p.handCount, statuses: (p.statuses || []).slice() };
+      })
+    };
+  }
+  function findActorByChange(v, prev, newLogs) {
+    var losers = (v.players || []).filter(function (p) {
+      var pp = prev.players ? prev.players[p.i] : null;
+      return pp && p.handCount < pp.handCount;
+    });
+    if (losers.length === 1) return losers[0];
+    for (var i = newLogs.length - 1; i >= 0; i--) {
+      var txt = newLogs[i].text || '';
+      var m = txt.match(/^(.+?)\s+(?:plays|drew)\s+/);
+      if (m) {
+        var found = (v.players || []).find(function (p) { return p.name === m[1]; });
+        if (found) return found;
+      }
+    }
+    return (v.players && v.players[prev.turnIndex]) || (v.players && v.players[v.turnIndex]) || null;
+  }
+  function findLastCardId(newLogs) {
+    for (var i = newLogs.length - 1; i >= 0; i--) {
+      if (newLogs[i].cardId) return String(newLogs[i].cardId).toUpperCase();
+    }
+    return '';
+  }
+  function findReasonLog(newLogs) {
+    for (var i = newLogs.length - 1; i >= 0; i--) {
+      var txt = newLogs[i].text || '';
+      if (txt.indexOf('— Round') !== 0) return txt;
+    }
+    return '';
   }
   function renderMobileBar(v) {
     var bar = $('#mobileBar');
@@ -400,9 +670,14 @@
     $('#turnPanel').innerHTML = h;
   }
   function renderPlayers(v) {
+    var now = v.serverNow || Date.now();
     var h = '<h3>PAWNS &amp; STATUS</h3><div class="plist">';
     v.players.forEach(function (p) {
-      h += '<div class="prow' + (p.i === v.turnIndex ? ' current' : '') + (p.alive ? '' : ' dead') + '">' +
+      var disc = '';
+      var sa = v.seatActive && v.seatActive[String(p.i)];
+      if (sa && now - sa > 120000) disc = ' DISCONNECTED';
+      else if (sa && now - sa > 60000 && p.i === v.turnIndex) disc = ' IDLE';
+      h += '<div class="prow' + (p.i === v.turnIndex ? ' current' : '') + (p.alive ? '' : ' dead') + disc + '">' +
         '<span class="pnum">' + (p.i + 1) + '</span>' +
         '<span><span class="pname">' + esc(p.name) + '</span>' +
         '<span class="tags">' + p.statuses.map(function (s) { return '<span class="tag">' + esc(s) + '</span>'; }).join('') +
@@ -445,6 +720,22 @@
     if (v.globalFlags && v.globalFlags.length) h += '<p class="muted" style="font-size:10px;margin:8px 0 0">' + esc(v.globalFlags.join(' · ')) + '</p>';
     $('#deckPanel').innerHTML = h;
   }
+  function renderCardActivity(v) {
+    var box = $('#cardActivity');
+    var face = $('#cardActivityFace');
+    var text = $('#cardActivityText');
+    if (!box || !face || !text) return;
+    var c = v.discardTop || v.lastCard;
+    if (!c) {
+      box.className = 'card-activity empty';
+      face.innerHTML = '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--mute);font-size:10px">—</div>';
+      text.textContent = 'No card played yet.';
+      return;
+    }
+    box.className = 'card-activity';
+    face.innerHTML = '<img src="' + c.img + '" alt="' + c.id.toUpperCase() + '" title="' + c.id.toUpperCase() + '">';
+    text.textContent = c.id.toUpperCase() + ' · ' + c.text;
+  }
   function renderDM(v) {
     var allowed = ui.mode === 'local' || online.seat === 0;
     $('#dmPanel').hidden = !allowed;
@@ -484,10 +775,39 @@
     if (ui.mode === 'local' && ui.noPrivacy) ui.privacySeat = focusSeat();
     var h = '', cls = 'modal', passive = false, privacy = false;
 
-    if (v.phase === 'gameover') {
+    if (v.lastElimination) {
+      var le = v.lastElimination;
+      h = '<div class="kicker">PLAYER OUT</div><h2>' + esc(le.name) + ' IS OUT</h2>' +
+        '<p><strong>Why:</strong> ' + esc(le.reason) + '</p>' +
+        '<p>Last tile: ' + (le.tile < 0 ? '−' + Math.abs(le.tile) : le.tile) + ' · Cards in hand when out: ' + le.handCount + '</p>' +
+        '<div class="actions"><button class="primary" data-ackelim>CONTINUE</button></div>';
+      cls = 'modal banner';
+      passive = true;
+    } else if (v.phase === 'gameover') {
       var w = v.winner == null ? null : v.players[v.winner];
+      var seqBreakdown = '';
+      if (w) {
+        if (w.seq === 3) {
+          seqBreakdown = '<div class="seqbreak"><h3>WIN SEQUENCE — 3 → 7 → 13</h3>' +
+            '<p>' + esc(w.name) + ' completed the 3 → 7 → 13 sequence over multiple turns:</p>' +
+            '<div class="seqsteps">3 → 7 → 13 (each landed on a separate turn)</div>' +
+            '<p class="muted">Sequence advances at most once per turn — each tile must be landed on in a different turn.</p></div>';
+        } else if (v.endReason && /gc10|bc30|vc20|vc34|vc35|instant/i.test(v.endReason)) {
+          seqBreakdown = '<div class="seqbreak"><h3>INSTANT RESULT</h3>' +
+            '<p>' + esc(v.endReason) + '</p>' +
+            '<p class="muted">This card ends the game immediately by design.</p></div>';
+        } else {
+          seqBreakdown = '<div class="seqbreak"><h3>HOW THE GAME ENDED</h3>' +
+            '<p>' + esc(v.endReason || 'The game has ended.') + '</p>' +
+            '<p class="muted">Check the LOG for the full sequence of moves and card plays.</p></div>';
+        }
+      } else if (v.endReason) {
+        seqBreakdown = '<div class="seqbreak"><h3>INSTANT RESULT</h3>' +
+          '<p>' + esc(v.endReason) + '</p>' +
+          '<p class="muted">This card ends the game immediately by design.</p></div>';
+      }
       h = '<div class="kicker">GAME OVER</div><h2>' + (w ? esc(w.name) + ' WINS' : 'NO ONE WINS') + '</h2>' +
-        '<p>' + esc(v.endReason || '') + '</p>' +
+        seqBreakdown +
         '<p class="muted">Some cards end the game immediately by design. The LOG shows the card and the full sequence of events.</p>' +
         '<div class="actions">' +
         '<button class="primary" data-newgame>NEW GAME</button><button class="ghost" data-menu>BACK TO MENU</button></div>';
@@ -575,6 +895,12 @@
     });
     $('#startLocal').addEventListener('click', function () { startLocal(false); });
     $('#resumeLocal').addEventListener('click', function () { startLocal(true); });
+    $('#practiceBots').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      $$('#practiceBots button').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+    });
+    $('#startPractice').addEventListener('click', function () { startPractice(); });
 
     // menu: online
     $('#createRoom').addEventListener('click', createRoom);
@@ -584,6 +910,17 @@
     $('#copyGameLink').addEventListener('click', function () { copyText(gameUrl()); });
     $('#roomLinkText').addEventListener('click', function () { copyText(linkFor(online.code)); });
     $('#leaveRoom').addEventListener('click', leaveRoom);
+    $('#partySize').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      $$('#partySize button').forEach(function (x) { x.classList.remove('on'); });
+      b.classList.add('on');
+      var n = Number(b.dataset.n);
+      postAction({ type: 'SET_CONFIG', cfg: { players: n } });
+    });
+    $('#roomSeats').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-kick]'); if (!b) return;
+      kickPlayer(Number(b.dataset.kick));
+    });
 
     // game: turn panel
     function turnButton(b) {
@@ -634,6 +971,7 @@
       }
       else if (k === 'new') {
         if (ui.mode === 'online') postAction({ type: 'RESET' });
+        else if (ui.practiceBot) startPractice();
         else startLocal(false);
       }
     });
@@ -650,6 +988,7 @@
       if (isPrivacy && b.dataset.privacy === undefined) { ui.privacySeat = focusSeat(); render(); return; }
       var v = currentView();
       if (b.dataset.privacy !== undefined) { ui.privacySeat = focusSeat(); render(); }
+      else if (b.dataset.ackelim !== undefined) { act({ type: 'ACK_ELIM' }); render(); }
       else if (b.dataset.ack !== undefined) act({ type: 'ACK' });
       else if (b.dataset.jazz !== undefined) toggleJazz(true);
       else if (b.dataset.opt !== undefined && v && v.prompt) {
@@ -663,9 +1002,15 @@
       else if (b.dataset.cancelconfirm !== undefined) { ui.confirmCard = null; render(); }
       else if (b.dataset.newgame !== undefined) {
         if (ui.mode === 'online') postAction({ type: 'RESET' });
+        else if (ui.practiceBot) startPractice();
         else startLocal(false);
       }
-      else if (b.dataset.menu !== undefined) { pollGeneration++; ui.mode = 'menu'; ui.screen = 'setup'; render(); }
+      else if (b.dataset.menu !== undefined) {
+        stopBots(); pollGeneration++;
+        ui.practiceBot = false; ui.prevState = null;
+        ui.mode = 'menu'; ui.screen = 'setup';
+        render();
+      }
     });
 
     // card index

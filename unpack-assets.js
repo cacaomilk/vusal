@@ -8,7 +8,7 @@ const path = require('path');
 const zlib = require('zlib');
 
 const ZIP = path.resolve(__dirname, 'assets.zip');
-const ROOT = process.cwd();
+const ROOT = __dirname;
 const buf = fs.readFileSync(ZIP);
 
 function sig(offset) {
