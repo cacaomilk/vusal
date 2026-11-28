@@ -71,7 +71,7 @@
   }
   function milestone(state, type, data) {
     if (!state.milestones) state.milestones = [];
-    state.milestones.push(Object.assign({ type: type, round: state.round }, data || {}));
+    state.milestones.push(Object.assign({ type: type, round: state.round, turnCount: state.turnCount }, data || {}));
     if (state.milestones.length > 260) {
       // Preserve earliest start, sequence milestones, eliminations, and finals if trimming very long games.
       var keep = [];
@@ -324,7 +324,7 @@
     }
     state.gameover = true; state.winner = pid; state.endReason = reason; state.phase = 'gameover';
     var wn = log(state, nameOf(state, pid) + ' WINS — ' + reason + '.');
-    milestone(state, 'win', { n: wn, pid: pid, reason: reason });
+    milestone(state, 'win', { n: wn, pid: pid, reason: reason, tile: P(state, pid).tile });
     state.queue.length = 0; state.prompt = null; state.reveal = null;
     state.banners = (state.banners || []).filter(function (b) { return b.kind === 'out'; });
   }
@@ -1474,7 +1474,7 @@
     state.lastDieRaw = raw; state.lastDie = die;
     p.lastRoll = die;
     var rn = log(state, nameOf(state, p.i) + ' rolled ' + raw + (die !== raw ? ' → ' + die : '') + '.');
-    milestone(state, 'roll', { n: rn, pid: p.i, raw: raw, die: die, turnLogN: state.lastTurnLogN });
+    milestone(state, 'roll', { n: rn, pid: p.i, raw: raw, die: die, fromTile: p.tile, turnLogN: state.lastTurnLogN });
     state.rolledThisTurn = true;
     state.canEndTurn = false;
 
@@ -1731,196 +1731,29 @@
     return state;
   }
 
-  /* ---------- win chronicle / premade phrases ---------- */
+  /* ---------- win explanation ---------- */
   var WIN_PHRASES = {
-    openers: [
-      'All pawns set out together from tile 1 [{start}].',
-      'With 108 cards shuffled into the deck, everyone began on tile 1 [{start}].',
-      'Pawns lined up shoulder-to-shoulder at the base of the board [{start}].',
-      'Across {rounds} chaotic rounds that started on tile 1 [{start}], the match took shape.',
-      'From the opening deal on tile 1 [{start}], every roll carried risk.',
-      'Once every pawn took its place on tile 1 [{start}], the race began.'
-    ],
-    turnContext: [
-      'By Round {round}, the decisive stretch was underway [{turn}].',
-      'Heading into Round {round}, the balance of the match shifted [{turn}].',
-      'In Round {round}, the final push began [{turn}].',
-      'Round {round} set up the closing stretch [{turn}].'
-    ],
-    ladders: [
-      '{name} caught a massive break up the {from} → {to} ladder [{n}]',
-      '{name} climbed the ladder from tile {from} straight up to {to} [{n}]',
-      '{name} skipped ahead of the pack by climbing {from} → {to} [{n}]',
-      '{name} hit the hidden ladder at {from} and rocketed onto {to} [{n}]'
-    ],
-    snakes: [
-      '{name} had to claw back after sliding down the snake at {from} → {to} [{n}]',
-      '{name} took a brutal drop on the {from} → {to} snake yet stayed in it [{n}]',
-      '{name} survived a nasty snake bite from tile {from} down to {to} [{n}]',
-      '{name} shook off a sharp slide from tile {from} down to {to} [{n}]'
-    ],
-    snakeMiracles: {
-      snake_immune: [
-        '{name} walked straight past the snake at {from} with snake immunity [{n}]',
-        '{name} stayed untouched on tile {from} thanks to GC8 [{n}]'
-      ],
-      snake_second_chance: [
-        '{name} turned the snake at {from} into a step ahead to tile {to} via GC21 [{n}]',
-        'GC21 rescued {name} right at snake {from}, bumping them onto {to} [{n}]'
-      ],
-      snake_mirror: [
-        '{name} flipped the snake at {from} into a ladder up to {to} with GC15 [{n}]',
-        'GC15 mirrored the snake at {from} upward onto tile {to} for {name} [{n}]'
-      ]
-    },
-    nemoIn: [
-      '{name} was banished below zero into Point Nemo [{n}]',
-      '{name} survived exile down in Point Nemo [{n}]',
-      '{name} endured a drop below zero into Point Nemo [{n}]'
-    ],
-    nemoOut: [
-      '{name} rolled an exact escape through zero back to tile 1 [{n}]',
-      '{name} broke out of Point Nemo on an exact roll back into contention [{n}]'
-    ],
-    seq1: [
-      '{name} opened the 3 → 7 → 13 run by landing on tile 3 [{n}]',
-      '{name} claimed tile 3 as the first step of the sequence [{n}]',
-      '{name} started the secret sequence by touching down on tile 3 [{n}]'
-    ],
-    seq2: [
-      '{name} returned on a separate turn to lock in tile 7 [{n}]',
-      '{name} reached 2/3 of the sequence by landing on tile 7 [{n}]',
-      '{name} stepped onto tile 7 to move one rung from a sequence win [{n}]'
-    ],
-    seq3: [
-      '{name} landed on tile 13 before the snake could bite to finish 3 → 7 → 13 [{n}]',
-      '{name} stepped onto tile 13 on a fresh turn to seal the sequence [{n}]'
-    ],
-    dramatic: {
-      swap: [
-        '{name} pulled off a pivotal tile swap via {card} [{n}]',
-        'a timely {card} tile swap reshaped positions on the board [{n}]'
-      ],
-      steal: [
-        '{name} snatched a card away from {target} with {card} [{n}]',
-        '{card} forced a sudden hand shake-up involving {name} [{n}]'
-      ],
-      warp1: [
-        'BC25 dragged the entire table all the way back to tile 1 [{n}]',
-        'everyone was reset back to the starting tile by BC25 [{n}]'
-      ],
-      warp50: [
-        'VC11 warped every surviving pawn straight onto tile 50 [{n}]',
-        'every pawn jumped together to tile 50 after VC11 fired [{n}]'
-      ],
-      gc13_save: [
-        '{name} defied elimination when GC13 blocked a loss on the spot [{n}]',
-        'GC13 kept {name} alive when defeat looked certain [{n}]'
-      ],
-      gc11_block: [
-        '{name} used GC11 to intercept {target}’s instant win and send them to tile 1 [{n}]',
-        'GC11 stopped an instant victory cold and reset {target} to the start [{n}]'
-      ],
-      vc25_block: [
-        'VC25 stepped in to block an instant game-ender [{n}]',
-        'an instant result card was shut down by VC25 before it could resolve [{n}]'
-      ],
-      vc32_negate: [
-        '{name} used VC32 to negate a card on impact [{n}]',
-        'VC32 canceled a card before its effect could land [{n}]'
-      ],
-      curse_hit: [
-        'a hidden curse on tile {tile} sprang onto {name} [{n}]',
-        'stepping onto a cursed tile triggered a hidden trap on {name} [{n}]'
-      ],
-      clear: [
-        'GC22 wiped every ongoing card rule clean off the table [{n}]'
-      ],
-      direction: [
-        'VC18 flipped the turn order into reverse [{n}]'
-      ],
-      exact_miss: [
-        '{name} was turned back from tile 100 by the exact-roll rule [{n}]',
-        'an overshoot stalled {name} shy of tile 100 [{n}]'
-      ],
-      gc33: [
-        'GC33 let {name} ignore the exact-roll rule at tile 100 [{n}]'
-      ]
-    },
-    elims: {
-      nemo9: [
-        '{name} sank all the way to tile −9 and was eliminated [{n}]',
-        '{name} hit the −9 floor of Point Nemo and dropped out [{n}]'
-      ],
-      bc30: [
-        '{name} drew BC30 and lost on the spot [{n}]',
-        'the instant-loss card BC30 knocked {name} out immediately [{n}]'
-      ],
-      bc22: [
-        '{name} had no Good cards to satisfy BC22 and was knocked out [{n}]'
-      ],
-      bc7: [
-        '{name} drew matching card types back-to-back while holding BC7 and lost [{n}]'
-      ],
-      bc11: [
-        '{name} went down in a mutual BC11 elimination [{n}]'
-      ],
-      prediction: [
-        '{name} missed a card-type prediction and was eliminated [{n}]'
-      ],
-      tableCall: [
-        '{name} failed a table call and exited the match [{n}]'
-      ],
-      dm: [
-        '{name} was removed from the match by the table [{n}]'
-      ],
-      other: [
-        '{name} was knocked out ({reason}) [{n}]'
-      ]
-    },
-    closers: {
-      tile100: [
-        'With a roll of {roll} [{rollN}], {winner} landed squarely on tile 100 to take the win [{winN}].',
-        'Stepping onto tile 100 after rolling {roll} [{rollN}] sealed victory for {winner} [{winN}].',
-        'With a roll of {roll} [{rollN}], {winner} reached tile 100 ahead of the field to clinch the match [{winN}].'
-      ],
-      tile100NoRoll: [
-        'Finally, {winner} arrived on tile 100 to claim victory [{winN}].',
-        'Landing squarely on tile 100 put {winner} over the top for the win [{winN}].'
-      ],
-      sequence: [
-        'Completing 3 [{s1}], 7 [{s2}], and 13 [{s3}] on separate turns bypassed tile 100 and handed {winner} the sequence win [{winN}].',
-        'By landing on 3 [{s1}], then 7 [{s2}], then 13 [{s3}] in turn order, {winner} triggered the secret sequence victory [{winN}].'
-      ],
-      lastStanding: [
-        'With every other rival out of the running, {winner} stood alone as the last player standing [{winN}].',
-        'Outlasting the entire table as opponents fell one by one crowned {winner} the winner [{winN}].'
-      ],
-      gc10: [
-        'Playing GC10 ended the race on the spot and gave {winner} an instant victory [{winN}].',
-        'No climb to 100 was needed — GC10 won the game immediately for {winner} [{winN}].'
-      ],
-      vc34_35: [
-        'Holding both VC34 and VC35 variants together triggered an instant combo win for {winner} [{winN}].',
-        'Uniting VC34 and VC35 in hand unlocked the variant instant win for {winner} [{winN}].'
-      ],
-      snake100: [
-        'Turning a snake straight onto tile 100 gave {winner} a dramatic finish [{winN}].',
-        'Riding a modified snake directly onto tile 100 sealed the match for {winner} [{winN}].'
-      ],
-      vc20: [
-        'Then VC20 hit the table and ended the entire match on the spot — nobody wins [{winN}].',
-        'In true VUSAL fashion, VC20 pulled the plug on the game immediately with zero winners [{winN}].'
-      ],
-      fallback: [
-        'That decisive moment brought the game to an end, making {winner} the winner [{winN}].'
-      ]
+    context: {
+      ladder: '{name} jumped up the {from} → {to} ladder [{n}].',
+      snake: '{name} slid down the {from} → {to} snake [{n}] before recovering.',
+      snake_immune: '{name} avoided the snake at {from} using GC8 [{n}].',
+      snake_second_chance: '{name} avoided the snake at {from} with GC21 and stepped to tile {to} [{n}].',
+      snake_mirror: '{name} flipped the snake at {from} into a ladder to tile {to} using GC15 [{n}].',
+      nemo_out: '{name} escaped Point Nemo on an exact roll to tile 1 [{n}].',
+      warp1: 'BC25 sent every player back to tile 1 [{n}].',
+      warp50: 'VC11 moved every surviving player to tile 50 [{n}].',
+      swap: '{name} swapped positions via {card} [{n}].',
+      steal: '{name} took a card from {target} via {card} [{n}].',
+      gc13_save: '{name} stayed in the game when GC13 blocked their elimination [{n}].',
+      gc11_block: '{name} used GC11 to block {target}’s instant win and send them to tile 1 [{n}].',
+      vc25_block: 'VC25 blocked an earlier instant-result card [{n}].',
+      exact_miss: '{name} overshot tile 100 and stayed on tile {tile} due to the exact-roll rule [{n}].',
+      elim: '{name} was eliminated ({reason}) [{n}].'
     }
   };
 
-  function pickPhrase(arr, seed) {
-    if (!arr || !arr.length) return '';
-    return arr[Math.abs(seed || 0) % arr.length];
+  function cleanReason(r) {
+    return String(r || '').replace(/\.+$/, '').trim();
   }
   function fmtPhrase(tpl, vars) {
     return String(tpl || '').replace(/\{(\w+)\}/g, function (_, k) {
@@ -1944,10 +1777,8 @@
     var ms = state.milestones || [];
     var w = state.winner == null ? null : P(state, state.winner);
     var winnerName = w ? nameOf(state, w.i) : 'No one';
-    var seed = (state.turnCount || 0) * 7 + (state.nextLogN || logs.length) + (w ? w.i * 13 : 5);
     var parts = [];
     var usedN = {};
-    var isSeqWin = !!(w && (w.seq === 3 || /3 → 7 → 13/.test(String(state.endReason || ''))));
 
     function addPart(text) {
       if (!text) return;
@@ -1956,140 +1787,181 @@
       parts.push({ text: text, cites: cites });
     }
 
-    var startM = ms.find(function (m) { return m.type === 'start'; }) || logs[0];
-    var startN = startM ? startM.n : 1;
-    addPart(fmtPhrase(pickPhrase(WIN_PHRASES.openers, seed), {
-      start: startN, rounds: state.round || 1
-    }));
-
-    // Collect key turning-point milestones (prioritize winner + eliminations + major twists)
-    var middle = [];
-    var seqSteps = {};
-    var lastWinRoll = null;
     var winM = null;
-
+    var seqSteps = {};
     ms.forEach(function (m) {
-      if (m.type === 'win' || m.type === 'no_win') { winM = m; return; }
-      if (m.type === 'roll' && w && m.pid === w.i) { lastWinRoll = m; return; }
-      if (m.type === 'seq' && w && m.pid === w.i) { seqSteps[m.step] = m; }
-      if (m.type === 'start') return;
-      if (isSeqWin && m.type === 'seq' && w && m.pid === w.i && m.step === 3) return;
-      var score = 1;
-      if (m.type === 'elim' || m.type === 'seq' || m.type === 'gc11_block' || m.type === 'gc13_save' || m.type === 'vc25_block') score += 5;
-      else if (m.type === 'ladder' || m.type === 'snake_mirror' || m.type === 'snake_second_chance' || m.type === 'warp' || m.type === 'nemo_out') score += 4;
-      else if (m.type === 'snake' || m.type === 'nemo_in' || m.type === 'swap' || m.type === 'steal' || m.type === 'curse_hit') score += 3;
-      if (w && m.pid === w.i) score += 2;
-      middle.push({ m: m, score: score });
+      if (m.type === 'win' || m.type === 'no_win') winM = m;
+      if (m.type === 'seq' && w && m.pid === w.i) seqSteps[m.step] = m;
     });
+    var winN = winM ? winM.n : (logs.length ? logs[logs.length - 1].n : 1);
+    var winTurn = winM ? winM.turnCount : state.turnCount;
+    var reason = String(state.endReason || '');
 
-    // Select top up to 5 distinct turning-point beats, then order chronologically by log #
-    middle.sort(function (a, b) { return b.score - a.score || a.m.n - b.m.n; });
-    var picked = [];
-    var pickedTypes = {};
-    for (var i = 0; i < middle.length && picked.length < 5; i++) {
-      var item = middle[i], m = item.m;
-      if (usedN[m.n]) continue;
-      // Avoid picking two duplicate generic snakes/ladders unless different players or rare
-      var key = m.type + ':' + (m.pid != null ? m.pid : '');
-      if (m.type !== 'elim' && m.type !== 'seq' && pickedTypes[key]) continue;
-      pickedTypes[key] = true;
-      picked.push(m);
-    }
-    picked.sort(function (a, b) { return a.n - b.n; });
-
-    // Optional round context if picked list is short
-    if (picked.length < 2 && lastWinRoll && lastWinRoll.turnLogN && lastWinRoll.turnLogN !== startN) {
-      addPart(fmtPhrase(pickPhrase(WIN_PHRASES.turnContext, seed + 1), {
-        round: lastWinRoll.round || state.round, turn: lastWinRoll.turnLogN
-      }));
-    }
-
-    picked.forEach(function (m, idx) {
+    function formatContextItem(m) {
       var nm = m.pid != null ? nameOf(state, m.pid) : 'A player';
       var tg = m.target != null ? nameOf(state, m.target) : 'another player';
-      var s = seed + idx * 3 + m.n;
-      var line = '';
-      switch (m.type) {
-        case 'ladder':
-          line = fmtPhrase(pickPhrase(WIN_PHRASES.ladders, s), { name: nm, from: m.from, to: m.to, n: m.n });
-          break;
-        case 'snake':
-          line = fmtPhrase(pickPhrase(WIN_PHRASES.snakes, s), { name: nm, from: m.from, to: m.to < 0 ? '−' + Math.abs(m.to) : m.to, n: m.n });
-          break;
-        case 'snake_immune': case 'snake_second_chance': case 'snake_mirror':
-          line = fmtPhrase(pickPhrase(WIN_PHRASES.snakeMiracles[m.type], s), { name: nm, from: m.from, to: m.to, n: m.n });
-          break;
-        case 'nemo_in':
-          line = fmtPhrase(pickPhrase(WIN_PHRASES.nemoIn, s), { name: nm, n: m.n });
-          break;
-        case 'nemo_out':
-          line = fmtPhrase(pickPhrase(WIN_PHRASES.nemoOut, s), { name: nm, n: m.n });
-          break;
-        case 'seq':
-          if (m.step === 1) line = fmtPhrase(pickPhrase(WIN_PHRASES.seq1, s), { name: nm, n: m.n });
-          else if (m.step === 2) line = fmtPhrase(pickPhrase(WIN_PHRASES.seq2, s), { name: nm, n: m.n });
-          else if (m.step === 3) line = fmtPhrase(pickPhrase(WIN_PHRASES.seq3, s), { name: nm, n: m.n });
-          break;
-        case 'warp':
-          line = fmtPhrase(pickPhrase(m.tile === 50 ? WIN_PHRASES.dramatic.warp50 : WIN_PHRASES.dramatic.warp1, s), { name: nm, n: m.n });
-          break;
-        case 'swap': case 'steal': case 'gc13_save': case 'gc11_block': case 'vc25_block':
-        case 'vc32_negate': case 'curse_hit': case 'clear': case 'direction': case 'exact_miss': case 'gc33':
-          line = fmtPhrase(pickPhrase(WIN_PHRASES.dramatic[m.type], s), {
-            name: nm, target: tg, card: m.cardId ? label(m.cardId) : 'a card', tile: m.tile, n: m.n
-          });
-          break;
-        case 'elim': {
-          var r = String(m.reason || '');
-          var grp = WIN_PHRASES.elims.other;
-          if (/−9|-9/.test(r)) grp = WIN_PHRASES.elims.nemo9;
-          else if (/bc30/i.test(r)) grp = WIN_PHRASES.elims.bc30;
-          else if (/bc22/i.test(r)) grp = WIN_PHRASES.elims.bc22;
-          else if (/bc7/i.test(r)) grp = WIN_PHRASES.elims.bc7;
-          else if (/bc11/i.test(r)) grp = WIN_PHRASES.elims.bc11;
-          else if (/prediction/i.test(r)) grp = WIN_PHRASES.elims.prediction;
-          else if (/table call/i.test(r)) grp = WIN_PHRASES.elims.tableCall;
-          else if (/removed by the table/i.test(r)) grp = WIN_PHRASES.elims.dm;
-          line = fmtPhrase(pickPhrase(grp, s), { name: nm, reason: r, n: m.n });
-          break;
-        }
+      if (m.type === 'warp') {
+        return fmtPhrase(m.tile === 50 ? WIN_PHRASES.context.warp50 : WIN_PHRASES.context.warp1, { n: m.n });
       }
-      if (line) addPart(line.charAt(0).toUpperCase() + line.slice(1) + '.');
-    });
-
-    // Closer sentence tailored to exact win condition
-    var winN = winM ? winM.n : (logs.length ? logs[logs.length - 1].n : startN);
-    var reason = String(state.endReason || '');
-    var closer = '';
-    if (!w) {
-      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.vc20, seed), { winN: winN });
-    } else if (w.seq === 3 || /3 → 7 → 13/.test(reason)) {
-      var s1 = seqSteps[1] ? seqSteps[1].n : startN;
-      var s2 = seqSteps[2] ? seqSteps[2].n : winN;
-      var s3 = seqSteps[3] ? seqSteps[3].n : winN;
-      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.sequence, seed), {
-        winner: winnerName, s1: s1, s2: s2, s3: s3, winN: winN
+      if (m.type === 'elim') {
+        return fmtPhrase(WIN_PHRASES.context.elim, { name: nm, reason: cleanReason(m.reason), n: m.n });
+      }
+      var tpl = WIN_PHRASES.context[m.type];
+      if (!tpl) return '';
+      return fmtPhrase(tpl, {
+        name: nm,
+        target: tg,
+        from: m.from,
+        to: m.to != null && m.to < 0 ? '−' + Math.abs(m.to) : m.to,
+        tile: m.tile,
+        card: m.cardId ? label(m.cardId) : 'a card',
+        n: m.n
       });
-    } else if (/last player standing/i.test(reason)) {
-      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.lastStanding, seed), { winner: winnerName, winN: winN });
-    } else if (/gc10/i.test(reason)) {
-      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.gc10, seed), { winner: winnerName, winN: winN });
-    } else if (/vc34|vc35/i.test(reason)) {
-      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.vc34_35, seed), { winner: winnerName, winN: winN });
-    } else if (/gc15|gc21/i.test(reason)) {
-      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.snake100, seed), { winner: winnerName, winN: winN });
-    } else if (/tile 100/i.test(reason)) {
-      if (lastWinRoll && lastWinRoll.n && lastWinRoll.n < winN) {
-        closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.tile100, seed), {
-          winner: winnerName, roll: lastWinRoll.die != null ? lastWinRoll.die : lastWinRoll.raw, rollN: lastWinRoll.n, winN: winN
-        });
-      } else {
-        closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.tile100NoRoll, seed), { winner: winnerName, winN: winN });
-      }
-    } else {
-      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.fallback, seed), { winner: winnerName, winN: winN });
     }
-    addPart(closer);
+
+    // 1. VC20: No one wins
+    if (!w) {
+      var prevVc25 = ms.filter(function (m) { return m.type === 'vc25_block' && m.cardId === 'vc20' && m.n < winN; });
+      if (prevVc25.length) {
+        var b0 = prevVc25[prevVc25.length - 1];
+        addPart('An earlier VC20 was blocked by VC25 [' + b0.n + '].');
+      }
+      if (winM && winM.pid != null) {
+        addPart('No one won because ' + nameOf(state, winM.pid) + ' triggered VC20 (“No one wins.”) [' + winN + '], ending the game immediately.');
+      } else {
+        addPart('No one won because VC20 (“No one wins.”) was triggered [' + winN + '], ending the game immediately.');
+      }
+    }
+    // 2. 3 -> 7 -> 13 Sequence Win
+    else if (w.seq === 3 || /3 → 7 → 13/.test(reason)) {
+      ms.forEach(function (m) {
+        if (m.n >= winN) return;
+        if (m.type === 'gc11_block' || m.type === 'vc25_block' || (m.type === 'gc13_save' && m.pid === w.i)) {
+          addPart(formatContextItem(m));
+        }
+      });
+      if (seqSteps[1] && seqSteps[2] && seqSteps[3]) {
+        addPart(winnerName + ' won via the 3 → 7 → 13 rule [' + winN + '] instead of reaching tile 100, landing on tile 3 [' + seqSteps[1].n + '], tile 7 [' + seqSteps[2].n + '], and tile 13 [' + seqSteps[3].n + '] on separate turns.');
+      } else {
+        addPart(winnerName + ' won via the 3 → 7 → 13 rule [' + winN + '] instead of reaching tile 100 by landing on 3, 7, and 13 on separate turns.');
+      }
+    }
+    // 3. Last Player Standing (Elimination Win)
+    else if (/last player standing/i.test(reason)) {
+      ms.forEach(function (m) {
+        if (m.n >= winN) return;
+        if ((m.type === 'gc13_save' || m.type === 'vc25_block') && m.pid === w.i) {
+          addPart(formatContextItem(m));
+        }
+      });
+      var elims = ms.filter(function (m) { return m.type === 'elim' && m.n < winN; });
+      if (elims.length === 1) {
+        var e0 = elims[0];
+        addPart(winnerName + ' won as the last remaining player [' + winN + '] after ' + nameOf(state, e0.pid) + ' was eliminated (' + cleanReason(e0.reason) + ') [' + e0.n + '].');
+      } else if (elims.length > 1) {
+        var list = elims.map(function (em) {
+          return nameOf(state, em.pid) + ' (' + cleanReason(em.reason) + ') [' + em.n + ']';
+        });
+        var joined = list.length === 2 ? (list[0] + ' and ' + list[1]) : (list.slice(0, -1).join(', ') + ', and ' + list[list.length - 1]);
+        addPart(winnerName + ' won as the last remaining player [' + winN + '] after all opponents were eliminated: ' + joined + '.');
+      } else {
+        addPart(winnerName + ' won as the last remaining player [' + winN + '].');
+      }
+    }
+    // 4. GC10 Instant Win
+    else if (/gc10/i.test(reason)) {
+      var blocks10 = ms.filter(function (m) {
+        return m.n < winN && (m.type === 'gc11_block' || m.type === 'vc25_block');
+      });
+      blocks10.slice(-2).forEach(function (m) { addPart(formatContextItem(m)); });
+      addPart(winnerName + ' won immediately by playing GC10 (instant win card) [' + winN + '].');
+    }
+    // 5. VC34 + VC35 Combo Instant Win
+    else if (/vc34|vc35/i.test(reason)) {
+      var comboCtx = ms.filter(function (m) {
+        return m.n < winN && (
+          m.type === 'vc25_block' ||
+          m.type === 'gc11_block' ||
+          (m.type === 'steal' && (m.pid === w.i || m.target === w.i))
+        );
+      });
+      comboCtx.slice(-2).forEach(function (m) { addPart(formatContextItem(m)); });
+      addPart(winnerName + ' won immediately by holding both VC34 and VC35 variants at the same time [' + winN + '].');
+    }
+    // 6. Tile 100 / Snake-to-100 Board Win
+    else if (/tile 100|gc15|gc21/i.test(reason)) {
+      var rollThisTurn = null, ladderThisTurn = null, miracleThisTurn = null, gc33ThisTurn = null, swapThisTurn = null;
+      ms.forEach(function (m) {
+        if (m.n >= winN) return;
+        if (m.turnCount === winTurn) {
+          if (m.type === 'roll' && m.pid === w.i) rollThisTurn = m;
+          if (m.type === 'ladder' && m.pid === w.i && m.to >= 100) ladderThisTurn = m;
+          if ((m.type === 'snake_mirror' || m.type === 'snake_second_chance') && m.pid === w.i && m.to >= 100) miracleThisTurn = m;
+          if (m.type === 'gc33' && m.pid === w.i) gc33ThisTurn = m;
+          if (m.type === 'swap') swapThisTurn = m;
+        }
+      });
+
+      // Only gather prior context that genuinely explains how winner got into position or why others didn't win first
+      var ctxCandidates = [];
+      var seenKey = {};
+      ms.forEach(function (m) {
+        if (m.n >= winN) return;
+        if (m === rollThisTurn || m === ladderThisTurn || m === miracleThisTurn || m === gc33ThisTurn || m === swapThisTurn) return;
+        var score = 0;
+        if (m.type === 'gc11_block' || m.type === 'vc25_block') score = 9;
+        else if (m.type === 'gc13_save' && m.pid === w.i) score = 9;
+        else if (m.type === 'exact_miss' && m.pid !== w.i) score = 8;
+        else if (m.type === 'warp') score = 7;
+        else if (m.type === 'snake_mirror' && m.pid === w.i) score = 7;
+        else if (m.type === 'ladder' && m.pid === w.i && (m.to - m.from) >= 15) score = 6;
+        else if (m.type === 'swap' && m.pid === w.i) score = 6;
+        else if (m.type === 'snake_second_chance' && m.pid === w.i) score = 5;
+        else if (m.type === 'nemo_out' && m.pid === w.i) score = 4;
+        else if (m.type === 'elim') score = 4;
+        else if (m.type === 'snake' && m.pid === w.i && (m.from - m.to) >= 15) score = 3;
+        if (!score) return;
+        var key = m.type + ':' + (m.pid != null ? m.pid : '');
+        if (m.type !== 'elim' && seenKey[key]) return;
+        seenKey[key] = true;
+        ctxCandidates.push({ m: m, score: score });
+      });
+      ctxCandidates.sort(function (a, b) { return b.score - a.score || a.m.n - b.m.n; });
+      var chosenCtx = ctxCandidates.slice(0, 3).map(function (x) { return x.m; });
+      chosenCtx.sort(function (a, b) { return a.n - b.n; });
+      chosenCtx.forEach(function (m) {
+        var line = formatContextItem(m);
+        if (line) addPart(line);
+      });
+
+      var rollStr = '';
+      if (rollThisTurn) {
+        var valStr = rollThisTurn.die !== rollThisTurn.raw ? (rollThisTurn.raw + ' → ' + rollThisTurn.die) : String(rollThisTurn.die);
+        var fromStr = rollThisTurn.fromTile != null ? (' from tile ' + (rollThisTurn.fromTile < 0 ? '−' + Math.abs(rollThisTurn.fromTile) : rollThisTurn.fromTile)) : '';
+        rollStr = 'rolling ' + valStr + fromStr + ' [' + rollThisTurn.n + ']';
+      }
+
+      if (miracleThisTurn) {
+        var verb = miracleThisTurn.type === 'snake_mirror'
+          ? ('using GC15 to turn the snake at ' + miracleThisTurn.from + ' into a ladder to tile ' + miracleThisTurn.to + ' [' + miracleThisTurn.n + ']')
+          : ('using GC21 at the snake on ' + miracleThisTurn.from + ' to step forward onto tile ' + miracleThisTurn.to + ' [' + miracleThisTurn.n + ']');
+        addPart(winnerName + ' won by reaching tile 100 [' + winN + '] after ' + (rollStr ? (rollStr + ' and ') : '') + verb + '.');
+      } else if (ladderThisTurn) {
+        addPart(winnerName + ' won by reaching tile 100 [' + winN + '] after ' + (rollStr ? (rollStr + ' and ') : '') + 'climbing the ' + ladderThisTurn.from + ' → ' + ladderThisTurn.to + ' ladder [' + ladderThisTurn.n + '].');
+      } else if (gc33ThisTurn && rollStr) {
+        addPart(winnerName + ' won by reaching tile 100 [' + winN + '] after ' + rollStr + ', using GC33 to bypass the exact-roll rule [' + gc33ThisTurn.n + '].');
+      } else if (rollStr) {
+        addPart(winnerName + ' won by reaching tile 100 [' + winN + '] after ' + rollStr + '.');
+      } else if (swapThisTurn) {
+        addPart(winnerName + ' won by reaching tile 100 [' + winN + '] via a tile swap with ' + (swapThisTurn.cardId ? label(swapThisTurn.cardId) : 'a card') + ' [' + swapThisTurn.n + '].');
+      } else {
+        addPart(winnerName + ' won by reaching tile 100 [' + winN + '].');
+      }
+    }
+    // 7. Fallback
+    else {
+      addPart(winnerName + ' won the match (' + cleanReason(reason) + ') [' + winN + '].');
+    }
 
     var allCites = Object.keys(usedN).map(Number).sort(function (a, b) { return a - b; });
     var citedLogs = allCites.map(function (n) {

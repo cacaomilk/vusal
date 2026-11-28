@@ -1046,10 +1046,11 @@
     if (w && w.seq === 3) {
       seqExtra = '<div class="seqsteps">3 → 7 → 13 (completed on separate turns)</div>';
     }
+    var explainHeading = w ? ('WHY ' + w.name.toUpperCase() + ' WON') : 'WHY THE GAME ENDED';
     return '<div class="kicker">GAME OVER</div>' +
       '<h2>' + esc(story ? story.headline : (w ? w.name + ' WINS' : 'NO ONE WINS')) + '</h2>' +
       '<div class="seqbreak win-story">' +
-      '<h3><span>HOW IT HAPPENED</span><button type="button" class="ghost small" data-openlog>FULL MATCH LOG</button></h3>' +
+      '<h3><span>' + esc(explainHeading) + '</span><button type="button" class="ghost small" data-openlog>FULL MATCH LOG</button></h3>' +
       seqExtra + partsHtml + citedHtml +
       '</div>' +
       '<p class="muted">Tap any bracketed number like [1] to highlight the exact log event below, or open the full match log.</p>' +
@@ -1060,8 +1061,8 @@
   function renderOverlay(v) {
     var ov = $('#overlay');
     if (!v) { ov.hidden = true; ov.innerHTML = ''; ov.classList.remove('passive', 'privacy-screen'); return; }
-    if (ui.mode === 'local' && ui.noPrivacy) ui.privacySeat = focusSeat();
-    var needPrivacy = (ui.mode === 'local' && !ui.noPrivacy && ui.privacySeat !== focusSeat());
+    if (ui.mode === 'local' && (ui.noPrivacy || v.phase === 'gameover')) ui.privacySeat = focusSeat();
+    var needPrivacy = (ui.mode === 'local' && !ui.noPrivacy && v.phase !== 'gameover' && ui.privacySeat !== focusSeat());
 
     // Keep search input focus alive while updating the Log Modal during polls/searches.
     if (ui.logModalOpen && !needPrivacy && !(v.banner && v.banner.kind === 'out') && ov.querySelector('#logModalSearch') && ov.querySelector('#logModalList')) {
