@@ -15,7 +15,9 @@
     screen: 'setup', mode: 'menu', localState: null, privacySeat: null,
     confirmCard: null, localPlayers: 2, onlinePlayers: 4,
     cardFilter: 'All', cardQuery: '', light: false, noPrivacy: false, toastTimer: null,
-    prevState: null, practiceBot: false, botBusy: false, botTimer: null
+    prevState: null, practiceBot: false, botBusy: false, botTimer: null,
+    cardBannerQueue: [], logModalOpen: false, logFilter: 'All', logQuery: '',
+    logReverse: true, highlightedCite: null, lastSeenLogN: 0
   };
   var online = { code: '', seat: 0, token: '', version: 0, state: null };
   var pollGeneration = 0;
@@ -74,19 +76,54 @@
     clearTimeout(ui.toastTimer);
     ui.toastTimer = setTimeout(function () { t.hidden = true; }, 1900);
   }
-  function cardToast(kind, id, text, actor) {
-    var t = $('#toast');
-    var badge = kind === 'draw' ? 'DREW' : kind === 'play' ? 'PLAYED' : kind === 'effect' ? 'EFFECT ON YOU' : 'CARD';
-    t.textContent = (actor ? actor + ' · ' : '') + badge + (id ? ' ' + id : '') + (text ? ' — ' + text : '');
-    t.style.background = kind === 'effect' ? '#8b1a1a' : 'var(--ink)';
-    t.style.color = kind === 'effect' ? '#ffffff' : 'var(--paper)';
-    t.hidden = false;
-    clearTimeout(ui.toastTimer);
-    ui.toastTimer = setTimeout(function () {
-      t.hidden = true;
-      t.style.background = 'var(--ink)';
-      t.style.color = 'var(--paper)';
-    }, 3200);
+  function cardToast(kind, id, text, actor, imgUrl) {
+    var badge = kind === 'draw' ? 'DREW' : kind === 'play' ? 'PLAYED' : kind === 'effect' ? 'EFFECT' : 'CARD';
+    var item = {
+      kind: kind,
+      badge: badge,
+      id: id ? String(id).toUpperCase() : '',
+      actor: actor || '',
+      text: text || '',
+      img: imgUrl || (id && C[String(id).toLowerCase()] ? C[String(id).toLowerCase()].img : '')
+    };
+    var tail = ui.cardBannerQueue[ui.cardBannerQueue.length - 1];
+    if (tail && tail.kind === item.kind && tail.id === item.id && tail.actor === item.actor && tail.text === item.text) return;
+    ui.cardBannerQueue.push(item);
+    if (ui.cardBannerQueue.length > 8) ui.cardBannerQueue.shift();
+    renderCardBanner();
+  }
+  function shiftCardBanner() {
+    if (!ui.cardBannerQueue.length) return;
+    ui.cardBannerQueue.shift();
+    renderCardBanner();
+  }
+  function clearCardBanners() {
+    ui.cardBannerQueue = [];
+    renderCardBanner();
+  }
+  function renderCardBanner(v) {
+    var el = $('#cardBanner');
+    if (!el) return;
+    var ov = $('#overlay');
+    if (ui.screen !== 'game' || !ui.cardBannerQueue.length || (ov && !ov.hidden) || (v && (v.banner || v.reveal || v.prompt || v.gameover))) {
+      el.hidden = true;
+      el.innerHTML = '';
+      return;
+    }
+    var b = ui.cardBannerQueue[0];
+    el.className = 'card-banner' + (b.kind === 'effect' ? ' alert' : '');
+    el.hidden = false;
+    var countTag = ui.cardBannerQueue.length > 1 ? '<span>1 OF ' + ui.cardBannerQueue.length + '</span>' : '';
+    var thumb = b.img ? '<img src="' + esc(b.img) + '" alt="' + esc(b.id) + '">' : '';
+    var title = (b.actor ? esc(b.actor) + ' · ' : '') + esc(b.badge) + (b.id ? ' ' + esc(b.id) : '');
+    el.innerHTML = thumb +
+      '<div class="cb-body">' +
+      '<div class="cb-kicker"><span>' + title + '</span>' + countTag + '</div>' +
+      '<div class="cb-text">' + esc(b.text) + '</div>' +
+      '<div class="cb-actions">' +
+      '<button type="button" class="primary small" data-dismiss-cb>' + (ui.cardBannerQueue.length > 1 ? 'NEXT (' + (ui.cardBannerQueue.length - 1) + ' MORE)' : 'GOT IT') + '</button>' +
+      '<button type="button" class="ghost small" data-openlog>LOG</button>' +
+      '</div></div>';
   }
 
   /* ---------------- navigation ---------------- */
@@ -108,7 +145,9 @@
         ov.hidden = true; ov.innerHTML = '';
         ov.classList.remove('passive', 'privacy-screen');
         ui.confirmCard = null;
+        ui.logModalOpen = false;
         $('#mobileBar').hidden = true;
+        renderCardBanner();
       }
       $('#modeBadge').textContent = ui.mode === 'local'
         ? (ui.practiceBot ? 'PRACTICE' : 'PASS & PLAY')
@@ -146,6 +185,9 @@
   function startLocal(resume) {
     stopBots();
     ui.prevState = null;
+    clearCardBanners();
+    ui.logModalOpen = false;
+    ui.highlightedCite = null;
     if (resume) {
       try {
         var raw = localStorage.getItem('vusal.local');
@@ -178,6 +220,9 @@
   function startPractice() {
     stopBots();
     ui.prevState = null;
+    clearCardBanners();
+    ui.logModalOpen = false;
+    ui.highlightedCite = null;
     var name = $('#practiceName').value.trim() || 'Player 1';
     var nBots = selectedPlayers('#practiceBots');
     var totalPlayers = 1 + nBots;
@@ -199,21 +244,24 @@
     saveLocal();
     go('game');
   }
+  function hasBlockingBanner(s) {
+    return !!(s && s.banners && s.banners.length);
+  }
   function maybeBotTurn() {
     if (ui.botBusy || !ui.practiceBot || ui.mode !== 'local' || ui.screen !== 'game' || !ui.localState) return;
     var v = ui.localState;
-    if (v.phase !== 'turn' || v.gameover || v.lastElimination || ui.confirmCard) return;
+    if (v.phase !== 'turn' || v.gameover || v.lastElimination || hasBlockingBanner(v) || ui.confirmCard || ui.logModalOpen) return;
     var actorSeat = focusSeat();
     if (actorSeat <= 0 || !v.players[actorSeat]) return;
     ui.botBusy = true;
-    ui.botTimer = setTimeout(botAct, 800);
+    ui.botTimer = setTimeout(botAct, 900);
   }
   function botAct() {
     if (!ui.practiceBot || ui.mode !== 'local' || ui.screen !== 'game' || !ui.localState) {
       ui.botBusy = false; return;
     }
     var v = ui.localState;
-    if (v.phase !== 'turn' || v.gameover || v.lastElimination || ui.confirmCard) {
+    if (v.phase !== 'turn' || v.gameover || v.lastElimination || hasBlockingBanner(v) || ui.confirmCard || ui.logModalOpen) {
       ui.botBusy = false; return;
     }
     var actorSeat = focusSeat();
@@ -221,18 +269,18 @@
     if (actorSeat <= 0 || !p) { ui.botBusy = false; return; }
 
     if (v.reveal) {
-      act({ type: 'ACK' });
+      act({ type: 'ACK' }, true);
     } else if (v.prompt) {
       botAnswer();
     } else if (!p.alive) {
-      if (v.canEndTurn) act({ type: 'END_TURN' });
+      if (v.canEndTurn) act({ type: 'END_TURN' }, true);
       else { ui.botBusy = false; return; }
     } else if (!v.rolledThisTurn) {
-      act({ type: 'ROLL' });
+      act({ type: 'ROLL' }, true);
     } else if (v.canEndTurn) {
       var card = (p.hand || []).find(function (c) { return !c.sticky && !c.passive && c.playable !== false; });
-      if (card) act({ type: 'PLAY_CARD', uid: card.uid });
-      else act({ type: 'END_TURN' });
+      if (card) act({ type: 'PLAY_CARD', uid: card.uid }, true);
+      else act({ type: 'END_TURN' }, true);
     } else {
       ui.botBusy = false;
       return;
@@ -247,7 +295,7 @@
     var opts = ui.localState.prompt.options || [];
     var pick = opts.find(function (o) { return !o.disabled; });
     if (pick == null) return;
-    act({ type: 'ANSWER', value: pick.value });
+    act({ type: 'ANSWER', value: pick.value }, true);
   }
   function saveLocal() {
     if (!ui.localState) return;
@@ -265,6 +313,9 @@
     ui.mode = 'menu';
     ui.screen = 'setup';
     ui.prevState = null;
+    clearCardBanners();
+    ui.logModalOpen = false;
+    ui.highlightedCite = null;
     $('#onlineForms').hidden = false;
     $('#roomCard').hidden = true;
     setRoomQuery('');
@@ -339,6 +390,9 @@
     stopBots();
     ui.practiceBot = false;
     ui.prevState = null;
+    clearCardBanners();
+    ui.logModalOpen = false;
+    ui.highlightedCite = null;
     $('#onlineError').textContent = '';
     var name = $('#createName').value.trim() || 'Player 1';
     ui.onlinePlayers = selectedPlayers('#onlinePlayers');
@@ -358,6 +412,9 @@
     stopBots();
     ui.practiceBot = false;
     ui.prevState = null;
+    clearCardBanners();
+    ui.logModalOpen = false;
+    ui.highlightedCite = null;
     $('#onlineError').textContent = '';
     var code = $('#joinCode').value.trim().toUpperCase();
     var name = $('#joinName').value.trim() || 'Player';
@@ -426,7 +483,17 @@
   }
 
   /* ---------------- actions ---------------- */
-  function act(action) {
+  function act(action, fromBot) {
+    if (!fromBot && (!ui.practiceBot || focusSeat() === 0 || (action && (action.type === 'ACK_BANNER' || action.type === 'ACK_ELIM')))) {
+      if (action && ['ROLL', 'PLAY_CARD', 'END_TURN', 'ANSWER', 'ACK', 'ACK_BANNER', 'ACK_ELIM'].indexOf(action.type) >= 0) {
+        shiftCardBanner();
+      }
+    }
+    if (action && action.type === 'RESET') {
+      clearCardBanners();
+      ui.logModalOpen = false;
+      ui.highlightedCite = null;
+    }
     if (ui.mode === 'local') {
       E.apply(ui.localState, action);
       saveLocal();
@@ -437,6 +504,9 @@
     var s = ui.localState;
     if (!s) return 0;
     if (s.reveal) return s.reveal.pid;
+    if (s.banners && s.banners.length && s.banners[0].pendingPids && s.banners[0].pendingPids.length) {
+      return s.banners[0].pendingPids[0];
+    }
     if (s.prompt) return s.prompt.forPid;
     return s.turnIndex;
   }
@@ -458,6 +528,7 @@
       $('#turnPanel').innerHTML = '<h3>NO GAME</h3><p class="muted">Choose PASS &amp; PLAY or an ONLINE ROOM.</p>';
       $('#mobileBar').hidden = true;
       renderOverlay(null);
+      renderCardBanner(null);
       return;
     }
     $('#roundInfo').textContent = 'ROUND ' + v.round + ' · TURN ' + (v.turnIndex + 1) + ' · ' + (v.direction === 1 ? 'CLOCKWISE' : 'COUNTER-CLOCKWISE');
@@ -470,16 +541,32 @@
     renderCardActivity(v);
     renderDM(v);
     renderLog(v);
-    renderOverlay(v);
-    renderMobileBar(v);
     checkCardActivity(v);
+    renderOverlay(v);
+    renderCardBanner(v);
+    renderMobileBar(v);
     if (ui.practiceBot && ui.mode === 'local' && ui.localState && ui.localState.phase === 'turn' && !ui.localState.gameover) maybeBotTurn();
+  }
+  function revealItems(r) {
+    if (!r) return [];
+    if (r.cards && r.cards.length) return r.cards;
+    if (r.card) return [{ card: r.card, text: r.text, kept: r.kept, public: r.public, jazz: r.jazz }];
+    return [];
+  }
+  function revealKey(r) {
+    if (!r) return '';
+    return r.pid + ':' + revealItems(r).map(function (it) { return it.card ? it.card.uid : 'secret'; }).join(',');
   }
   function checkCardActivity(v) {
     if (!v || (ui.mode !== 'online' && !ui.practiceBot)) { ui.prevState = null; return; }
     if (v.phase === 'lobby') { ui.prevState = cloneView(v); return; }
     var prev = ui.prevState;
     if (!prev || v.version < prev.version || (v.turnCount === 0 && v.discardCount === 0 && prev.discardCount > 0)) {
+      ui.prevState = cloneView(v);
+      return;
+    }
+    // When a blocking banner or personal draw modal is already waiting for the user, don't duplicate it.
+    if ((v.banner && v.canAckBanner) || (v.reveal && v.reveal.pid === (ui.mode === 'online' ? v.yourSeat : 0))) {
       ui.prevState = cloneView(v);
       return;
     }
@@ -524,15 +611,27 @@
         : findLastCardId(newLogs) || 'CARD';
       var logDetail = findReasonLog(newLogs);
       var msg = logDetail && v.discardTop && v.discardTop.text ? v.discardTop.text + ' (' + effectReason + ')' : (logDetail || effectReason);
-      cardToast('effect', effCard, msg, actor ? actor.name : '');
+      cardToast('effect', effCard, msg, actor ? actor.name : '', v.discardTop ? v.discardTop.img : '');
     } else if (v.discardCount > prev.discardCount && v.discardTop) {
       var last = v.discardTop;
-      cardToast('play', last.id.toUpperCase(), last.text, actor ? actor.name : '');
-    } else if (v.reveal && (!prev.reveal || prev.reveal.uid !== v.reveal.card.uid || prev.reveal.pid !== v.reveal.pid)) {
+      cardToast('play', last.id.toUpperCase(), last.text, actor ? actor.name : '', last.img);
+    } else if (v.reveal && (!prev.reveal || prev.reveal.key !== revealKey(v.reveal))) {
       var drawer = v.players[v.reveal.pid];
-      cardToast('draw', v.reveal.card.id.toUpperCase(), v.reveal.card.text, v.reveal.pid === mySeat ? 'You' : (drawer ? drawer.name : ''));
+      var items = revealItems(v.reveal);
+      var pubCards = items.filter(function (it) { return !!it.card; });
+      if (items.length > 1) {
+        var desc = pubCards.length
+          ? 'drew ' + items.length + ' cards (' + pubCards.map(function (it) { return it.card.id.toUpperCase(); }).join(', ') + (pubCards.length < items.length ? ' + secret' : '') + ')'
+          : 'drew ' + items.length + ' cards';
+        cardToast('draw', pubCards[0] ? pubCards[0].card.id.toUpperCase() : 'CARDS', desc, v.reveal.pid === mySeat ? 'You' : (drawer ? drawer.name : ''), pubCards[0] ? pubCards[0].card.img : '');
+      } else if (pubCards[0]) {
+        cardToast('draw', pubCards[0].card.id.toUpperCase(), pubCards[0].card.text, v.reveal.pid === mySeat ? 'You' : (drawer ? drawer.name : ''), pubCards[0].card.img);
+      } else {
+        cardToast('draw', 'CARD', 'drew a secret card', drawer ? drawer.name : '');
+      }
     } else if (v.waiting && v.waiting.kind === 'reveal' && (!prev.waiting || prev.waiting.pid !== v.waiting.pid || prev.waiting.kind !== 'reveal')) {
-      cardToast('draw', 'CARD', 'drew a secret card', v.waiting.name);
+      var wc = v.waiting.count || 1;
+      cardToast('draw', 'CARD', 'drew ' + (wc > 1 ? wc + ' secret cards' : 'a secret card'), v.waiting.name);
     } else if (curYou && prevYou && curYou.handCount > prevYou.handCount) {
       var drawn = curYou.handCount - prevYou.handCount;
       cardToast('draw', 'CARD', 'drew ' + drawn + ' card' + (drawn > 1 ? 's' : ''), 'You');
@@ -564,7 +663,8 @@
       discardCount: v.discardCount,
       discardTop: v.discardTop,
       lastLogN: logs.length ? logs[logs.length - 1].n : 0,
-      reveal: v.reveal ? { uid: v.reveal.card.uid, pid: v.reveal.pid } : null,
+      reveal: v.reveal ? { key: revealKey(v.reveal), pid: v.reveal.pid } : null,
+      banner: v.banner ? v.banner.id : 0,
       waiting: v.waiting ? { kind: v.waiting.kind, pid: v.waiting.pid } : null,
       you: v.you ? { handCount: v.you.handCount } : null,
       players: (v.players || []).map(function (p) {
@@ -606,16 +706,19 @@
     if (ui.screen !== 'game' || v.phase === 'gameover' || v.phase === 'lobby') { bar.hidden = true; return; }
     bar.hidden = false;
     var isActor = v.yourSeat === v.turnIndex;
-    var blocked = !!(v.reveal || v.prompt || v.waiting);
+    var blocked = !!(v.reveal || v.prompt || v.waiting || v.banner || v.lastElimination);
     var turnName = v.players[v.turnIndex] ? v.players[v.turnIndex].name : '—';
     var tile = v.players[v.turnIndex] ? v.players[v.turnIndex].tile : '—';
-    var h = '<div class="mb-info"><b>' + esc(turnName) + '</b><span>TILE ' + (tile < 0 ? '−' + Math.abs(tile) : tile) + ' · ROUND ' + v.round + '</span></div>';
+    var latestN = v.log && v.log.length ? v.log[v.log.length - 1].n : 0;
+    var hasNew = latestN > ui.lastSeenLogN;
+    var h = '<div class="mb-info"><b>' + esc(turnName) + '</b><span>TILE ' + (tile < 0 ? '−' + Math.abs(tile) : tile) + ' · R' + v.round + '</span></div>';
     if (blocked) h += '<button class="mb-btn" disabled>CARD</button>';
     else if (!isActor) h += '<button class="mb-btn" disabled>WAIT</button>';
     else if (!v.rolledThisTurn) h += '<button class="mb-btn primary" data-roll>ROLL</button>';
     else if (v.canEndTurn) h += '<button class="mb-btn primary" data-end>END TURN</button>';
     else h += '<button class="mb-btn" disabled>•••</button>';
     h += '<button class="mb-btn" data-jumphand>HAND ' + (v.you ? v.you.hand.length : 0) + '</button>';
+    h += '<button class="mb-btn' + (hasNew ? ' has-new' : '') + '" data-openlog>LOG' + (latestN ? ' ' + latestN : '') + '</button>';
     bar.innerHTML = h;
   }
   function renderBoard(v) {
@@ -652,12 +755,12 @@
   function renderTurn(v) {
     var isActor = v.yourSeat === v.turnIndex;
     var turnName = v.players[v.turnIndex] ? v.players[v.turnIndex].name : '—';
-    var blocked = !!(v.reveal || v.prompt || v.waiting);
+    var blocked = !!(v.reveal || v.prompt || v.waiting || v.banner || v.lastElimination);
     var h = '<h3>TURN</h3><div class="turn-line"><b>' + esc(turnName) + '</b><span>SEAT ' + (v.turnIndex + 1) + ' / TILE ' + (v.players[v.turnIndex] ? v.players[v.turnIndex].tile : '—') + '</span></div>';
     h += '<div class="die">' + (v.lastDieRaw == null ? '–' : v.lastDieRaw) + '</div>';
     if (v.lastDieRaw != null && v.lastDie !== v.lastDieRaw) h += '<p class="muted" style="margin-top:-8px">modified roll → ' + v.lastDie + '</p>';
     if (v.phase === 'lobby') h += '<p class="muted">Waiting for the host to start.</p>';
-    else if (blocked) h += '<div class="waiting-note">Resolving a card…</div>';
+    else if (blocked) h += '<div class="waiting-note">' + (v.banner ? 'Waiting for banner confirmation…' : 'Resolving a card…') + '</div>';
     else if (!isActor) h += '<div class="waiting-note">Waiting for ' + esc(turnName) + '.</div>';
     else if (!v.rolledThisTurn) {
       h += '<button class="bigbtn" data-roll>ROLL d6</button>';
@@ -752,94 +855,272 @@
       '<button data-dm="reshuffle">RESHUFFLE</button><button data-dm="reverse">REVERSE ORDER</button>' +
       '<button data-dm="clear">CLEAR RULES</button><button data-dm="end">FORCE END TURN</button>' +
       '</div><button class="dm-wide" data-dm="undo">UNDO LAST ACTION</button>' +
+      (v.banner ? '<button class="dm-wide" data-dm="skipbanner">SKIP ACTIVE BANNER</button>' : '') +
       '<button class="dm-wide" data-dm="privacy">PASS-THE-DEVICE SCREENS: ' + (ui.noPrivacy ? 'OFF' : 'ON') + '</button>' +
       '<button class="dm-wide" data-dm="new">' + (ui.mode === 'online' ? 'RESET ROOM (HOST)' : 'NEW GAME') + '</button>';
     h += '<p class="muted" style="font-size:10px;margin:8px 0 0">The table has the final say on anything the engine cannot judge.</p>';
     $('#dmControls').innerHTML = h;
   }
-  function renderLog(v) {
-    var lines = v.log.slice(-90).reverse();
-    $('#logPanel').innerHTML = '<h3>LOG</h3>' + lines.map(function (l) {
+  function logCategory(l) {
+    var txt = l.text || '';
+    if (txt.indexOf('— Round') === 0 || txt.indexOf('rolls again') >= 0 || txt.indexOf('cannot roll') >= 0) return 'Turns';
+    if (l.cardId || /\b(bc|gc|vc)\d+\b/i.test(txt) || /card|drew|steals|forfeit|discard/i.test(txt)) return 'Cards';
+    return 'Moves';
+  }
+  function filterLogs(v) {
+    var q = ui.logQuery.toLowerCase().trim();
+    var arr = (v.log || []).filter(function (l) {
+      if (ui.logFilter !== 'All' && logCategory(l) !== ui.logFilter) return false;
+      if (q) {
+        var hay = ('[' + l.n + '] ' + (l.cardId || '') + ' ' + l.text).toLowerCase();
+        if (hay.indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+    return ui.logReverse ? arr.slice().reverse() : arr;
+  }
+  function renderLogLinesHtml(v, interactive) {
+    var lines = filterLogs(v);
+    if (!lines.length) return '<div class="empty-note" style="padding:12px 0">No matching log entries.</div>';
+    return lines.map(function (l) {
       var thumb = l.cardId && C[l.cardId] ? '<img src="' + img(l.cardId) + '" alt="" loading="lazy">' : '';
-      return '<div class="logline' + (l.text.indexOf('— Round') === 0 ? ' turn' : '') + '"><span class="ln">' + l.n + '</span>' + thumb + '<span>' + esc(l.text) + '</span></div>';
+      var isTurn = l.text.indexOf('— Round') === 0;
+      var isHl = ui.highlightedCite === l.n;
+      var numEl = interactive
+        ? '<span class="ln">[' + l.n + ']</span>'
+        : '<button type="button" class="ln-btn" data-openlog-n="' + l.n + '">[' + l.n + ']</button>';
+      return '<div class="logline' + (isTurn ? ' turn' : '') + (isHl ? ' hl' : '') + '" data-log-n="' + l.n + '">' +
+        numEl + thumb + '<span>' + esc(l.text) + '</span></div>';
     }).join('');
+  }
+  function renderLog(v) {
+    var lines = (v.log || []).slice(-90).reverse();
+    $('#logPanel').innerHTML = '<div class="log-head"><h3>LOG</h3><button type="button" class="ghost small" data-openlog>FULL LOG</button></div>' +
+      lines.map(function (l) {
+        var thumb = l.cardId && C[l.cardId] ? '<img src="' + img(l.cardId) + '" alt="" loading="lazy">' : '';
+        return '<div class="logline' + (l.text.indexOf('— Round') === 0 ? ' turn' : '') + '">' +
+          '<button type="button" class="ln-btn" data-openlog-n="' + l.n + '">[' + l.n + ']</button>' +
+          thumb + '<span>' + esc(l.text) + '</span></div>';
+      }).join('');
   }
 
   /* ---------------- overlays ---------------- */
   function overlayCardFace(c) {
     return '<div class="cardface"><img src="' + c.img + '" alt="' + c.id.toUpperCase() + '"><div class="ftext">' + esc(c.text) + '</div></div>';
   }
+  function renderStoryProse(text) {
+    var s = String(text || '');
+    var out = '', last = 0;
+    s.replace(/\[(\d+)\]/g, function (match, num, idx) {
+      out += esc(s.slice(last, idx));
+      var n = Number(num);
+      var on = ui.highlightedCite === n ? ' on' : '';
+      out += '<button type="button" class="cite-pill' + on + '" data-cite="' + n + '">[' + n + ']</button>';
+      last = idx + match.length;
+      return match;
+    });
+    out += esc(s.slice(last));
+    return out;
+  }
+  function openLogModal(citeN) {
+    ui.logModalOpen = true;
+    if (citeN != null) {
+      ui.highlightedCite = Number(citeN);
+      ui.logReverse = false;
+      ui.logFilter = 'All';
+      ui.logQuery = '';
+    }
+    var v = currentView();
+    if (v && v.log && v.log.length) ui.lastSeenLogN = v.log[v.log.length - 1].n;
+    renderOverlay(v);
+    renderCardBanner(v);
+    if (citeN != null) {
+      var row = $('#overlay .logline[data-log-n="' + citeN + '"]');
+      if (row && row.scrollIntoView) row.scrollIntoView({ block: 'center' });
+    }
+  }
+  function renderLogModalHtml(v) {
+    var latestN = v.log && v.log.length ? v.log[v.log.length - 1].n : 0;
+    if (latestN > ui.lastSeenLogN) ui.lastSeenLogN = latestN;
+    var filters = ['All', 'Turns', 'Cards', 'Moves'];
+    return '<div class="kicker"><span>MATCH LOG · ' + (v.log ? v.log.length : 0) + ' ENTRIES</span><span>ROUND ' + v.round + '</span></div>' +
+      '<h2>GAME LOG</h2>' +
+      '<div class="log-toolbar">' +
+      '<div class="seg" id="logFilterSeg">' +
+      filters.map(function (f) {
+        return '<button type="button" data-logfilter="' + f + '"' + (ui.logFilter === f ? ' class="on"' : '') + '>' + f.toUpperCase() + '</button>';
+      }).join('') +
+      '</div>' +
+      '<input id="logModalSearch" value="' + esc(ui.logQuery) + '" placeholder="Search card, player, or #number">' +
+      '<button type="button" class="ghost small" data-logorder>' + (ui.logReverse ? 'NEWEST FIRST' : 'OLDEST FIRST') + '</button>' +
+      '</div>' +
+      '<div id="logModalList" class="log-scroll">' + renderLogLinesHtml(v, true) + '</div>' +
+      '<div class="actions"><button type="button" class="primary" data-closelog>CLOSE LOG</button></div>';
+  }
+  function renderBannerHtml(v) {
+    var b = v.banner;
+    var kickerLeft = b.kind === 'out' ? 'PLAYER OUT' : (b.private ? 'PRIVATE CARD' : 'CARD EFFECT');
+    var kickerRight = (v.bannersCount && v.bannersCount > 1) ? ('1 OF ' + v.bannersCount) : '';
+    var pendingNames = (b.pendingPids || []).map(function (pid) {
+      return v.players[pid] ? v.players[pid].name : 'Player ' + (pid + 1);
+    }).join(', ');
+    var bodyHtml = '';
+    if (b.card) {
+      bodyHtml = overlayCardFace(b.card) + '<p>' + esc(b.text) + '</p>';
+    } else if (b.cardId && C[b.cardId]) {
+      bodyHtml = '<div class="cardface"><img src="' + esc(C[b.cardId].img) + '" alt="' + esc(b.cardId.toUpperCase()) + '"><div class="ftext">' + esc(b.text) + '</div></div>';
+    } else {
+      bodyHtml = '<p>' + esc(b.text) + '</p>';
+    }
+    if (b.detail) bodyHtml += '<p class="muted">' + esc(b.detail) + '</p>';
+    var btnHtml = v.canAckBanner
+      ? '<button type="button" class="primary" data-ackbanner>CONTINUE</button>'
+      : '<button type="button" class="ghost" disabled>WAITING FOR ' + esc(pendingNames || 'PLAYER') + '</button>';
+    return '<div class="kicker"><span>' + kickerLeft + '</span>' + (kickerRight ? '<span>' + kickerRight + '</span>' : '') + '</div>' +
+      '<h2>' + esc(b.title || 'NOTICE') + '</h2>' +
+      bodyHtml +
+      '<div class="actions">' + btnHtml + '<button type="button" class="ghost" data-openlog>LOG</button></div>';
+  }
+  function renderRevealHtml(v) {
+    var r = v.reveal, owner = v.players[r.pid] ? v.players[r.pid].name : 'the player';
+    var items = revealItems(r);
+    var hasJazz = !!(r.jazz || items.some(function (it) { return it.jazz; }));
+    var body = '';
+    if (items.length <= 1) {
+      var it = items[0] || { card: r.card, text: r.text, kept: r.kept };
+      if (!it.card || it.secret) {
+        body = '<div class="kicker">DRAWN CARD · SECRET</div><h2>SECRET CARD</h2>' +
+          '<p>' + esc(it.text || 'Kept secret in hand.') + '</p>' +
+          (it.statusNote ? '<div class="status-note">' + esc(it.statusNote) + '</div>' : '');
+      } else {
+        body = '<div class="kicker">DRAWN CARD · ' + it.card.type.toUpperCase() + ' · ' + (it.kept ? 'KEPT IN HAND' : 'PLAYED IMMEDIATELY') + '</div>' +
+          '<h2>' + it.card.id.toUpperCase() + '</h2>' + overlayCardFace(it.card) +
+          (it.statusNote ? '<div class="status-note">' + esc(it.statusNote) + '</div>' : '');
+      }
+    } else {
+      body = '<div class="kicker"><span>DRAWN CARDS · ' + items.length + ' CARDS</span><span>' + esc(owner.toUpperCase()) + '</span></div>' +
+        '<h2>DREW ' + items.length + ' CARDS</h2>' +
+        '<div class="reveal-grid">' + items.map(function (it) {
+          if (!it.card || it.secret) {
+            return '<div class="rcard secret"><div class="rcard-id">SECRET CARD</div>' +
+              '<div class="rcard-text">' + esc(it.text || 'Kept secret in hand.') + '</div>' +
+              (it.statusNote ? '<div class="rcard-note">' + esc(it.statusNote) + '</div>' : '') + '</div>';
+          }
+          return '<div class="rcard">' +
+            '<div class="rcard-top"><img src="' + esc(it.card.img) + '" alt="' + esc(it.card.id.toUpperCase()) + '">' +
+            '<div class="rcard-meta"><div class="rcard-id">' + esc(it.card.id.toUpperCase()) + '</div>' +
+            '<div class="rcard-type">' + esc(it.card.type.toUpperCase()) + '</div>' +
+            '<span class="rcard-badge">' + (it.kept ? 'KEPT IN HAND' : 'RESOLVES NEXT') + '</span></div></div>' +
+            '<div class="rcard-text">' + esc(it.card.text) + '</div>' +
+            (it.statusNote ? '<div class="rcard-note">' + esc(it.statusNote) + '</div>' : '') +
+            '</div>';
+        }).join('') + '</div>';
+    }
+    return {
+      wide: items.length > 1,
+      html: body +
+        (hasJazz ? '<div style="margin-top:10px"><button type="button" class="ghost" data-jazz>PLAY JAZZ (GC25)</button></div>' : '') +
+        '<div class="actions">' +
+        (v.canAck ? '<button type="button" class="primary" data-ack>CONTINUE</button>' : '<button type="button" class="ghost" disabled>WAITING FOR ' + esc(owner) + '</button>') +
+        '<button type="button" class="ghost" data-openlog>LOG</button></div>'
+    };
+  }
+  function renderGameOverHtml(v) {
+    var w = v.winner == null ? null : v.players[v.winner];
+    var story = v.winStory;
+    var partsHtml = story && story.parts
+      ? '<p class="win-prose">' + story.parts.map(function (pt) { return renderStoryProse(pt.text); }).join(' ') + '</p>'
+      : '<p>' + esc(v.endReason || 'The game has ended.') + '</p>';
+
+    var citedHtml = '';
+    if (story && story.citedLogs && story.citedLogs.length) {
+      citedHtml = '<div class="cite-list">' + story.citedLogs.map(function (l) {
+        var on = ui.highlightedCite === l.n ? ' on' : '';
+        var thumb = l.cardId && C[l.cardId] ? '<img src="' + esc(C[l.cardId].img) + '" alt="">' : '';
+        return '<button type="button" class="cite-item' + on + '" data-cite="' + l.n + '">' +
+          '<span class="ln">[' + l.n + ']</span>' + thumb +
+          '<span class="ct">' + esc(l.text) + '</span></button>';
+      }).join('') + '</div>';
+    }
+    var seqExtra = '';
+    if (w && w.seq === 3) {
+      seqExtra = '<div class="seqsteps">3 → 7 → 13 (completed on separate turns)</div>';
+    }
+    return '<div class="kicker">GAME OVER</div>' +
+      '<h2>' + esc(story ? story.headline : (w ? w.name + ' WINS' : 'NO ONE WINS')) + '</h2>' +
+      '<div class="seqbreak win-story">' +
+      '<h3><span>HOW IT HAPPENED</span><button type="button" class="ghost small" data-openlog>FULL MATCH LOG</button></h3>' +
+      seqExtra + partsHtml + citedHtml +
+      '</div>' +
+      '<p class="muted">Tap any bracketed number like [1] to highlight the exact log event below, or open the full match log.</p>' +
+      '<div class="actions">' +
+      '<button type="button" class="primary" data-newgame>NEW GAME</button>' +
+      '<button type="button" class="ghost" data-menu>BACK TO MENU</button></div>';
+  }
   function renderOverlay(v) {
     var ov = $('#overlay');
     if (!v) { ov.hidden = true; ov.innerHTML = ''; ov.classList.remove('passive', 'privacy-screen'); return; }
     if (ui.mode === 'local' && ui.noPrivacy) ui.privacySeat = focusSeat();
+    var needPrivacy = (ui.mode === 'local' && !ui.noPrivacy && ui.privacySeat !== focusSeat());
+
+    // Keep search input focus alive while updating the Log Modal during polls/searches.
+    if (ui.logModalOpen && !needPrivacy && !(v.banner && v.banner.kind === 'out') && ov.querySelector('#logModalSearch') && ov.querySelector('#logModalList')) {
+      ov.querySelector('#logModalList').innerHTML = renderLogLinesHtml(v, true);
+      var latestN = v.log && v.log.length ? v.log[v.log.length - 1].n : 0;
+      if (latestN > ui.lastSeenLogN) ui.lastSeenLogN = latestN;
+      return;
+    }
+
     var h = '', cls = 'modal', passive = false, privacy = false;
 
-    if (v.lastElimination) {
-      var le = v.lastElimination;
-      h = '<div class="kicker">PLAYER OUT</div><h2>' + esc(le.name) + ' IS OUT</h2>' +
-        '<p><strong>Why:</strong> ' + esc(le.reason) + '</p>' +
-        '<p>Last tile: ' + (le.tile < 0 ? '−' + Math.abs(le.tile) : le.tile) + ' · Cards in hand when out: ' + le.handCount + '</p>' +
-        '<div class="actions"><button class="primary" data-ackelim>CONTINUE</button></div>';
+    if (v.banner && v.banner.kind === 'out') {
       cls = 'modal banner';
-      passive = true;
+      h = renderBannerHtml(v);
+    } else if (ui.logModalOpen && !needPrivacy) {
+      cls = 'modal wide log-modal';
+      h = renderLogModalHtml(v);
     } else if (v.phase === 'gameover') {
-      var w = v.winner == null ? null : v.players[v.winner];
-      var seqBreakdown = '';
-      if (w) {
-        if (w.seq === 3) {
-          seqBreakdown = '<div class="seqbreak"><h3>WIN SEQUENCE — 3 → 7 → 13</h3>' +
-            '<p>' + esc(w.name) + ' completed the 3 → 7 → 13 sequence over multiple turns:</p>' +
-            '<div class="seqsteps">3 → 7 → 13 (each landed on a separate turn)</div>' +
-            '<p class="muted">Sequence advances at most once per turn — each tile must be landed on in a different turn.</p></div>';
-        } else if (v.endReason && /gc10|bc30|vc20|vc34|vc35|instant/i.test(v.endReason)) {
-          seqBreakdown = '<div class="seqbreak"><h3>INSTANT RESULT</h3>' +
-            '<p>' + esc(v.endReason) + '</p>' +
-            '<p class="muted">This card ends the game immediately by design.</p></div>';
-        } else {
-          seqBreakdown = '<div class="seqbreak"><h3>HOW THE GAME ENDED</h3>' +
-            '<p>' + esc(v.endReason || 'The game has ended.') + '</p>' +
-            '<p class="muted">Check the LOG for the full sequence of moves and card plays.</p></div>';
-        }
-      } else if (v.endReason) {
-        seqBreakdown = '<div class="seqbreak"><h3>INSTANT RESULT</h3>' +
-          '<p>' + esc(v.endReason) + '</p>' +
-          '<p class="muted">This card ends the game immediately by design.</p></div>';
-      }
-      h = '<div class="kicker">GAME OVER</div><h2>' + (w ? esc(w.name) + ' WINS' : 'NO ONE WINS') + '</h2>' +
-        seqBreakdown +
-        '<p class="muted">Some cards end the game immediately by design. The LOG shows the card and the full sequence of events.</p>' +
-        '<div class="actions">' +
-        '<button class="primary" data-newgame>NEW GAME</button><button class="ghost" data-menu>BACK TO MENU</button></div>';
+      cls = 'modal wide';
+      h = renderGameOverHtml(v);
     } else if (ui.confirmCard) {
       var c = ui.confirmCard;
       h = '<div class="kicker">PLAY A CARD · ' + c.type.toUpperCase() + '</div><h2>' + c.id.toUpperCase() + '</h2>' + overlayCardFace(c) +
         '<p>Playing resolves its effect and the card goes to the discard pile.</p><div class="actions">' +
-        '<button class="primary" data-playconfirm>PLAY</button><button class="ghost" data-cancelconfirm>CANCEL</button></div>';
-    } else if (ui.mode === 'local' && !ui.noPrivacy && ui.privacySeat !== focusSeat()) {
+        '<button type="button" class="primary" data-playconfirm>PLAY</button><button type="button" class="ghost" data-cancelconfirm>CANCEL</button></div>';
+    } else if (needPrivacy) {
+      ui.logModalOpen = false;
       var f = focusSeat(), nm = v.players[f] ? v.players[f].name : 'Player ' + (f + 1);
       privacy = true;
       h = '<div class="frame"><div class="kicker">PASS THE DEVICE</div>' +
         '<div class="pnum">' + (f + 1) + '</div><h2>' + esc(nm) + '</h2>' +
         '<p>The board and every hand stay hidden until you confirm it is your turn. Make sure nobody else can see the screen.</p>' +
-        '<button class="primary" data-privacy>I’M ' + esc(nm) + ' — REVEAL</button>' +
+        '<button type="button" class="primary" data-privacy>I’M ' + esc(nm) + ' — REVEAL</button>' +
         '<div class="hint">PRESS ENTER, OR TAP ANYWHERE ON THIS SCREEN</div>' +
-        '<button class="skip" data-noprivacy>TURN OFF THESE SCREENS FOR THIS DEVICE</button></div>';
+        '<button type="button" class="skip" data-noprivacy>TURN OFF THESE SCREENS FOR THIS DEVICE</button></div>';
       cls = 'modal privacy';
+    } else if (v.banner) {
+      cls = 'modal banner';
+      h = renderBannerHtml(v);
+    } else if (v.lastElimination) {
+      var le = v.lastElimination;
+      h = '<div class="kicker">PLAYER OUT</div><h2>' + esc(le.name) + ' IS OUT</h2>' +
+        '<p><strong>Why:</strong> ' + esc(le.reason) + '</p>' +
+        '<p>Last tile: ' + (le.tile < 0 ? '−' + Math.abs(le.tile) : le.tile) + ' · Cards in hand when out: ' + le.handCount + '</p>' +
+        '<div class="actions"><button type="button" class="primary" data-ackelim>CONTINUE</button></div>';
+      cls = 'modal banner';
     } else if (v.reveal) {
-      var r = v.reveal, owner = v.players[r.pid] ? v.players[r.pid].name : 'the player';
-      h = '<div class="kicker">DRAWN CARD · ' + r.card.type.toUpperCase() + ' · ' + (r.kept ? 'KEPT IN HAND' : 'PLAYED IMMEDIATELY') + '</div>' +
-        '<h2>' + r.card.id.toUpperCase() + '</h2>' + overlayCardFace(r.card) +
-        (r.jazz ? '<button class="ghost" data-jazz>PLAY JAZZ (GC25)</button>' : '') +
-        '<div class="actions">' + (v.canAck ? '<button class="primary" data-ack>CONTINUE</button>' : '<button class="ghost" disabled>WAITING FOR ' + esc(owner) + '</button>') + '</div>';
+      var rev = renderRevealHtml(v);
+      cls = rev.wide ? 'modal wide' : 'modal';
+      h = rev.html;
     } else if (v.prompt && v.canAnswer) {
       var p = v.prompt;
-      h = '<div class="kicker">' + (p.cardId ? p.cardId.toUpperCase() + ' · ' : '') + 'DECISION</div><h2>' + esc(p.title) + '</h2><p>' + esc(p.text) + '</p>';
+      h = '<div class="kicker"><span>' + (p.cardId ? p.cardId.toUpperCase() + ' · ' : '') + 'DECISION</span></div><h2>' + esc(p.title) + '</h2><p>' + esc(p.text) + '</p>';
       if (p.peek && p.peek.length) h += '<div class="peek">' + p.peek.map(function (c) { return '<img src="' + c.img + '" title="' + c.id.toUpperCase() + ' — ' + esc(c.text) + '">'; }).join('') + '</div>';
       h += '<div class="optlist">' + p.options.map(function (o, i) {
-        return '<button class="opt" data-opt="' + i + '"' + (o.disabled ? ' disabled' : '') + '>' +
+        return '<button type="button" class="opt" data-opt="' + i + '"' + (o.disabled ? ' disabled' : '') + '>' +
           (o.img ? '<img src="' + o.img + '" alt="">' : '') + '<span class="ol">' + esc(o.label) + '</span></button>';
-      }).join('') + '</div>';
+      }).join('') + '</div>' +
+      '<div class="actions"><button type="button" class="ghost" data-openlog>LOG</button></div>';
     } else if (v.waiting) {
       h = '<div class="kicker">WAITING</div><h2>' + esc(v.waiting.name) + '</h2><p>' + esc(v.waiting.title || 'is looking at a card. Hands stay private until they are done.') + '</p>';
       cls = 'modal banner'; passive = true;
@@ -922,9 +1203,10 @@
       kickPlayer(Number(b.dataset.kick));
     });
 
-    // game: turn panel
+    // game: turn panel & mobile bar
     function turnButton(b) {
       if (!b) return;
+      if (b.dataset.openlog !== undefined) { openLogModal(); renderMobileBar(currentView()); return; }
       if (b.dataset.jumphand !== undefined) {
         var hp = $('#handPanel');
         if (hp && hp.scrollIntoView) hp.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -938,6 +1220,23 @@
     function onTurnClick(e) { turnButton(e.target.closest('button')); }
     $('#turnPanel').addEventListener('click', onTurnClick);
     $('#mobileBar').addEventListener('click', onTurnClick);
+    var boardLogBtn = $('#boardLogBtn');
+    if (boardLogBtn) boardLogBtn.addEventListener('click', function () { openLogModal(); });
+
+    // sidebar log
+    $('#logPanel').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      if (b.dataset.openlogN !== undefined) openLogModal(Number(b.dataset.openlogN));
+      else if (b.dataset.openlog !== undefined) openLogModal();
+    });
+
+    // persistent card banner
+    $('#cardBanner').addEventListener('click', function (e) {
+      var b = e.target.closest('button'); if (!b) return;
+      if (b.dataset.dismissCb !== undefined) { shiftCardBanner(); }
+      else if (b.dataset.openlog !== undefined) { openLogModal(); }
+    });
+
     // hand
     $('#handPanel').addEventListener('click', function (e) {
       var b = e.target.closest('[data-card]'); if (!b) return;
@@ -962,6 +1261,7 @@
       else if (k === 'reverse') act({ type: 'DM_REVERSE' });
       else if (k === 'clear') act({ type: 'DM_CLEAR_RULES' });
       else if (k === 'end') act({ type: 'DM_END_TURN' });
+      else if (k === 'skipbanner') act({ type: 'DM_SKIP_BANNER' });
       else if (k === 'undo') act({ type: 'UNDO' });
       else if (k === 'privacy') {
         ui.noPrivacy = !ui.noPrivacy; savePrefs();
@@ -976,7 +1276,17 @@
       }
     });
 
-    // overlay
+    // overlay search input (live update without losing focus)
+    $('#overlay').addEventListener('input', function (e) {
+      if (e.target && e.target.id === 'logModalSearch') {
+        ui.logQuery = e.target.value;
+        var listEl = $('#overlay #logModalList');
+        var v = currentView();
+        if (listEl && v) listEl.innerHTML = renderLogLinesHtml(v, true);
+      }
+    });
+
+    // overlay clicks
     $('#overlay').addEventListener('click', function (e) {
       var isPrivacy = $('#overlay').classList.contains('privacy-screen');
       var b = e.target.closest('button');
@@ -988,6 +1298,32 @@
       if (isPrivacy && b.dataset.privacy === undefined) { ui.privacySeat = focusSeat(); render(); return; }
       var v = currentView();
       if (b.dataset.privacy !== undefined) { ui.privacySeat = focusSeat(); render(); }
+      else if (b.dataset.openlog !== undefined) { openLogModal(); }
+      else if (b.dataset.closelog !== undefined) { ui.logModalOpen = false; renderOverlay(v); renderCardBanner(v); }
+      else if (b.dataset.logfilter !== undefined) {
+        ui.logFilter = b.dataset.logfilter;
+        $$('#overlay #logFilterSeg button').forEach(function (x) { x.classList.toggle('on', x.dataset.logfilter === ui.logFilter); });
+        var listEl = $('#overlay #logModalList');
+        if (listEl && v) listEl.innerHTML = renderLogLinesHtml(v, true);
+      }
+      else if (b.dataset.logorder !== undefined) {
+        ui.logReverse = !ui.logReverse;
+        b.textContent = ui.logReverse ? 'NEWEST FIRST' : 'OLDEST FIRST';
+        var listEl2 = $('#overlay #logModalList');
+        if (listEl2 && v) listEl2.innerHTML = renderLogLinesHtml(v, true);
+      }
+      else if (b.dataset.cite !== undefined) {
+        var citeN = Number(b.dataset.cite);
+        if (ui.highlightedCite === citeN) {
+          openLogModal(citeN);
+        } else {
+          ui.highlightedCite = citeN;
+          renderOverlay(v);
+          var item = $('#overlay .cite-item[data-cite="' + citeN + '"]');
+          if (item && item.scrollIntoView) item.scrollIntoView({ block: 'nearest' });
+        }
+      }
+      else if (b.dataset.ackbanner !== undefined) { act({ type: 'ACK_BANNER' }); }
       else if (b.dataset.ackelim !== undefined) { act({ type: 'ACK_ELIM' }); render(); }
       else if (b.dataset.ack !== undefined) act({ type: 'ACK' });
       else if (b.dataset.jazz !== undefined) toggleJazz(true);
@@ -1007,6 +1343,8 @@
       }
       else if (b.dataset.menu !== undefined) {
         stopBots(); pollGeneration++;
+        clearCardBanners();
+        ui.logModalOpen = false; ui.highlightedCite = null;
         ui.practiceBot = false; ui.prevState = null;
         ui.mode = 'menu'; ui.screen = 'setup';
         render();
@@ -1024,11 +1362,17 @@
     // keyboard: 1-6 manual dice, enter to continue
     document.addEventListener('keydown', function (e) {
       if (e.target && /input|textarea|select/i.test(e.target.tagName)) return;
+      if (ui.logModalOpen && e.key === 'Escape') {
+        e.preventDefault(); ui.logModalOpen = false; var vEsc = currentView(); renderOverlay(vEsc); renderCardBanner(vEsc); return;
+      }
       if ($('#overlay').classList.contains('privacy-screen') && (e.key === 'Enter' || e.key === ' ')) {
         e.preventDefault(); ui.privacySeat = focusSeat(); render(); return;
       }
       var v = currentView();
-      if (v && v.reveal && v.canAck && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); act({ type: 'ACK' }); }
+      if (!ui.logModalOpen && v && (e.key === 'Enter' || e.key === ' ')) {
+        if (v.banner && v.canAckBanner) { e.preventDefault(); act({ type: 'ACK_BANNER' }); return; }
+        if (v.reveal && v.canAck) { e.preventDefault(); act({ type: 'ACK' }); return; }
+      }
     });
   }
 

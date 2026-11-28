@@ -63,10 +63,55 @@
   }
 
   function log(state, text, cardId) {
-    state.log.push({ n: state.log.length + 1, text: text, cardId: cardId || null });
-    if (state.log.length > 240) state.log.splice(0, state.log.length - 240);
+    state.nextLogN = (state.nextLogN || (state.log.length ? state.log[state.log.length - 1].n : 0)) + 1;
+    var n = state.nextLogN;
+    state.log.push({ n: n, text: text, cardId: cardId || null });
+    if (state.log.length > 600) state.log.splice(0, state.log.length - 600);
+    return n;
   }
-  function nameOf(state, pid) { return P(state, pid).name || 'Player ' + (pid + 1); }
+  function milestone(state, type, data) {
+    if (!state.milestones) state.milestones = [];
+    state.milestones.push(Object.assign({ type: type, round: state.round }, data || {}));
+    if (state.milestones.length > 260) {
+      // Preserve earliest start, sequence milestones, eliminations, and finals if trimming very long games.
+      var keep = [];
+      for (var i = 0; i < state.milestones.length; i++) {
+        var m = state.milestones[i];
+        if (i === 0 || m.type === 'seq' || m.type === 'elim' || m.type === 'win' || m.type === 'no_win' || i >= state.milestones.length - 180) {
+          keep.push(m);
+        }
+      }
+      state.milestones = keep;
+    }
+  }
+  function nameOf(state, pid) { return P(state, pid) ? (P(state, pid).name || 'Player ' + (pid + 1)) : 'Player ' + (pid + 1); }
+
+  function pushBanner(state, o) {
+    if (!state.banners) state.banners = [];
+    var seen = {};
+    var pids = (o.pendingPids || []).filter(function (pid) {
+      if (typeof pid !== 'number' || !P(state, pid) || seen[pid]) return false;
+      seen[pid] = true;
+      return true;
+    });
+    if (!pids.length) return null;
+    var b = {
+      id: state.nextUid++,
+      kind: o.kind || 'effect',
+      cardId: o.cardId || null,
+      card: o.card || null,
+      cards: o.cards || null,
+      title: o.title || 'CARD NOTICE',
+      text: o.text || '',
+      detail: o.detail || '',
+      actor: o.actor != null ? o.actor : null,
+      private: !!o.private,
+      pendingPids: pids,
+      allPids: pids.slice()
+    };
+    state.banners.push(b);
+    return b;
+  }
 
   function makePlayer(i, name) {
     return {
@@ -94,10 +139,10 @@
       players: players,
       turnIndex: 0, direction: 1, turnCount: 0, round: 1,
       deck: [], discard: [], curses: {}, flags: {}, watchers: [],
-      queue: [], reveal: null, prompt: null, lastCard: null,
+      queue: [], reveal: null, prompt: null, banners: [], lastCard: null,
       canEndTurn: false, rolledThisTurn: false, turnStartTile: 1,
       lastDieRaw: null, lastDie: null, jazzCue: false,
-      log: [], nextUid: 1, history: [], lastElimination: null
+      log: [], nextLogN: 0, milestones: [], nextUid: 1, history: [], lastElimination: null
     };
   }
 
@@ -110,7 +155,8 @@
     state.discard = [];
     state.phase = 'turn';
     state.turnIndex = 0;
-    log(state, 'A new game begins. 108 cards shuffled. Everyone starts on tile 1.');
+    var sn = log(state, 'A new game begins. 108 cards shuffled. Everyone starts on tile 1.');
+    milestone(state, 'start', { n: sn });
     beginTurn(state);
   }
 
@@ -176,11 +222,33 @@
     addHand(state, toPid, card);
     if (curse) {
       delete card.meta.cursedWith;
-      log(state, label(card.id) + ' was cursed — the hidden ' + label(curse.id) + ' triggers on ' + nameOf(state, toPid) + '.', curse.id);
-      state.queue.push({ t: 'apply', card: curse, pid: toPid, fromPid: fromPid });
+      var cn = log(state, label(card.id) + ' was cursed — the hidden ' + label(curse.id) + ' triggers on ' + nameOf(state, toPid) + '.', curse.id);
+      milestone(state, 'curse_hit', { n: cn, pid: toPid, cardId: curse.id, tile: P(state, toPid).tile });
+      state.queue.push({ t: 'banner', banner: {
+        kind: 'effect', cardId: curse.id, card: cardView(curse),
+        title: 'CURSED CARD — ' + label(curse.id),
+        text: label(card.id) + ' was cursed! The hidden ' + label(curse.id) + ' triggers on ' + nameOf(state, toPid) + '.',
+        actor: fromPid, pendingPids: [toPid]
+      } });
+      state.queue.push({ t: 'apply', card: curse, pid: toPid, fromPid: 'curse' });
     }
   }
   function handGood(state, pid) { return P(state, pid).hand.filter(function (c) { return typeOf(c.id) === 'Good'; }); }
+  function globalBannerPids(state, actor) {
+    if (state.cfg.practiceBot) return [0];
+    if (state.cfg.online) {
+      var alive = state.players.filter(function (q) { return q.alive; }).map(function (q) { return q.i; });
+      return alive.length ? alive : [0];
+    }
+    return [actor != null ? actor : state.turnIndex];
+  }
+  function elimBannerPids(state, pid) {
+    if (state.cfg.practiceBot) return [0];
+    if (state.cfg.online) {
+      return state.players.filter(function (q) { return q.alive || q.i === pid; }).map(function (q) { return q.i; });
+    }
+    return [state.turnIndex];
+  }
 
   /* ---------- movement / landing ---------- */
   function setRawTile(state, pid, tile) {
@@ -196,23 +264,31 @@
     opts = opts || {};
     tile = clamp(Math.round(tile), -9, 100);
     setRawTile(state, pid, tile);
-    if (opts.landing !== false) checkLanding(state, pid);
+    if (opts.landing !== false) checkLanding(state, pid, opts);
   }
-  function moveBy(state, pid, delta, fromPid) {
+  function moveBy(state, pid, delta, fromPid, opts) {
     var p = P(state, pid), amt = Math.abs(delta);
     if (delta < 0 && fromPid != null && fromPid !== pid &&
         (hasCard(state, pid, 'gc24') || hasCard(state, pid, 'gc6'))) {
-      log(state, nameOf(state, pid) + ' reflects the drag back onto ' + nameOf(state, fromPid) + '.');
-      moveBy(state, fromPid, -amt, null);
+      var rn = log(state, nameOf(state, pid) + ' reflects the drag back onto ' + nameOf(state, fromPid) + '.');
+      milestone(state, 'reflect', { n: rn, pid: pid, target: fromPid });
+      pushBanner(state, {
+        kind: 'effect', cardId: hasCard(state, pid, 'gc24') ? 'gc24' : 'gc6',
+        title: 'DRAG REFLECTED',
+        text: nameOf(state, pid) + ' reflected the −' + amt + ' move back onto ' + nameOf(state, fromPid) + '.',
+        actor: pid, pendingPids: state.cfg.practiceBot ? [0] : [fromPid, pid]
+      });
+      moveBy(state, fromPid, -amt, null, opts);
       return;
     }
-    setTile(state, pid, p.tile + delta, { landing: true });
+    setTile(state, pid, p.tile + delta, Object.assign({ landing: true }, opts || {}));
   }
-  function forward(state, pid, n) { moveBy(state, pid, Math.abs(n), null); }
-  function back(state, pid, n, fromPid) { moveBy(state, pid, -Math.abs(n), fromPid == null ? null : fromPid); }
-  function toNemo(state, pid) {
+  function forward(state, pid, n, opts) { moveBy(state, pid, Math.abs(n), null, opts); }
+  function back(state, pid, n, fromPid, opts) { moveBy(state, pid, -Math.abs(n), fromPid == null ? null : fromPid, opts); }
+  function toNemo(state, pid, cardId) {
     setRawTile(state, pid, -1);
-    log(state, nameOf(state, pid) + ' is sent to Point Nemo (tile −1). No cards can be drawn there.');
+    var nn = log(state, nameOf(state, pid) + ' is sent to Point Nemo (tile −1). No cards can be drawn there.', cardId || null);
+    milestone(state, 'nemo_in', { n: nn, pid: pid, cardId: cardId || null });
   }
 
   function instantBlocked(state) {
@@ -221,20 +297,36 @@
   function win(state, pid, reason, instant) {
     if (state.gameover) return;
     if (instant && instantBlocked(state)) {
-      log(state, 'An instant result card tried to fire, but VC25 blocks it.');
+      var bn = log(state, 'An instant result card tried to fire, but VC25 blocks it.', 'vc25');
+      milestone(state, 'vc25_block', { n: bn, pid: pid, cardId: 'vc25' });
+      pushBanner(state, {
+        kind: 'effect', cardId: 'vc25',
+        title: 'VC25 — BLOCKED',
+        text: 'An instant result card tried to fire, but VC25 blocked it.',
+        pendingPids: globalBannerPids(state, pid)
+      });
       return;
     }
     if (/^gc10/i.test(String(reason || ''))) {
       var guard = state.players.find(function (q) { return q.i !== pid && q.alive && hasCard(state, q.i, 'gc11'); });
       if (guard) {
-        log(state, nameOf(state, guard.i) + ' holds GC11 — ' + nameOf(state, pid) + ' goes to the start instead of winning.');
+        var gn = log(state, nameOf(state, guard.i) + ' holds GC11 — ' + nameOf(state, pid) + ' goes to the start instead of winning.', 'gc11');
+        milestone(state, 'gc11_block', { n: gn, pid: guard.i, target: pid });
+        pushBanner(state, {
+          kind: 'effect', cardId: 'gc11',
+          title: 'GC11 — WIN REDIRECTED',
+          text: nameOf(state, guard.i) + ' holds GC11 — ' + nameOf(state, pid) + ' goes to tile 1 instead of winning.',
+          actor: guard.i, pendingPids: state.cfg.practiceBot ? [0] : [pid, guard.i]
+        });
         setTile(state, pid, 1, { landing: false });
         return;
       }
     }
     state.gameover = true; state.winner = pid; state.endReason = reason; state.phase = 'gameover';
-    log(state, nameOf(state, pid) + ' WINS — ' + reason + '.');
+    var wn = log(state, nameOf(state, pid) + ' WINS — ' + reason + '.');
+    milestone(state, 'win', { n: wn, pid: pid, reason: reason });
     state.queue.length = 0; state.prompt = null; state.reveal = null;
+    state.banners = (state.banners || []).filter(function (b) { return b.kind === 'out'; });
   }
   function lose(state, pid, reason, instant) {
     var p = P(state, pid);
@@ -242,18 +334,41 @@
     if (hasCard(state, pid, 'gc13')) {
       var save = p.hand.find(function (c) { return c.id === 'gc13'; });
       if (save) { pluckCard(state, pid, save.uid); discardCard(state, save); }
-      log(state, nameOf(state, pid) + ' would lose, but GC13 says: you will not, in fact, lose.');
+      var sn = log(state, nameOf(state, pid) + ' would lose, but GC13 says: you will not, in fact, lose.', 'gc13');
+      milestone(state, 'gc13_save', { n: sn, pid: pid });
+      pushBanner(state, {
+        kind: 'effect', cardId: 'gc13',
+        title: 'GC13 — SAVED FROM LOSS',
+        text: nameOf(state, pid) + ' would lose (' + reason + '), but GC13 saved them.',
+        actor: pid, pendingPids: globalBannerPids(state, pid)
+      });
       return;
     }
     if (instant && instantBlocked(state)) {
-      log(state, 'The instant loss was blocked by VC25.');
+      var bn = log(state, 'The instant loss was blocked by VC25.', 'vc25');
+      milestone(state, 'vc25_block', { n: bn, pid: pid, cardId: 'vc25' });
+      pushBanner(state, {
+        kind: 'effect', cardId: 'vc25',
+        title: 'VC25 — BLOCKED',
+        text: 'The instant loss on ' + nameOf(state, pid) + ' was blocked by VC25.',
+        pendingPids: globalBannerPids(state, pid)
+      });
       return;
     }
     var handCount = p.hand.length;
     p.alive = false;
     returnHandToDeck(state, pid);
     state.lastElimination = { pid: pid, name: nameOf(state, pid), reason: reason, tile: p.tile, handCount: handCount };
-    log(state, nameOf(state, pid) + ' is out — ' + reason + '.');
+    var en = log(state, nameOf(state, pid) + ' is out — ' + reason + '.');
+    milestone(state, 'elim', { n: en, pid: pid, reason: reason, tile: p.tile });
+    pushBanner(state, {
+      kind: 'out',
+      title: nameOf(state, pid) + ' IS OUT',
+      text: reason,
+      detail: 'Last tile: ' + (p.tile < 0 ? '−' + Math.abs(p.tile) : p.tile) + ' · Cards in hand when out: ' + handCount,
+      actor: pid,
+      pendingPids: elimBannerPids(state, pid)
+    });
     var alive = state.players.filter(function (q) { return q.alive; });
     if (alive.length === 1) win(state, alive[0].i, 'last player standing', false);
   }
@@ -271,15 +386,18 @@
     }
     p.seq += 1;
     p.seqTurn = state.turnCount;
-    log(state, nameOf(state, pid) + ' completes ' + want + ' of the 3 → 7 → 13 sequence (' + p.seq + '/3).');
+    var qn = log(state, nameOf(state, pid) + ' completes ' + want + ' of the 3 → 7 → 13 sequence (' + p.seq + '/3).');
+    milestone(state, 'seq', { n: qn, pid: pid, step: p.seq, tile: want });
     if (p.seq === 3) { win(state, pid, 'landed on 3 → 7 → 13 in order', false); return true; }
     return false;
   }
 
-  function checkLanding(state, pid) {
+  function checkLanding(state, pid, opts) {
+    opts = opts || {};
     var p = P(state, pid), t = p.tile;
     state.lastLanded = { pid: pid, tile: t };
     var checkedThirteen = false;
+    var boardEvent = null;
 
     // The final 13 is resolved before its snake, per the table interpretation.
     if (t === 13 && p.seq === 2) {
@@ -292,23 +410,33 @@
       var head = t, tail = SNAKES[head];
       if (tail != null) {
         if (hasCard(state, pid, 'gc8') && !state.flags.snakeImmunityBanned) {
-          log(state, nameOf(state, pid) + ' is immune to the snake at ' + head + '.');
+          var i8 = log(state, nameOf(state, pid) + ' is immune to the snake at ' + head + '.', 'gc8');
+          milestone(state, 'snake_immune', { n: i8, pid: pid, from: head });
+          boardEvent = { cardId: 'gc8', title: 'SNAKE IMMUNE (GC8)', text: nameOf(state, pid) + ' stayed on tile ' + head + ' — immune to the snake.' };
         } else if (hasCard(state, pid, 'gc21')) {
           setRawTile(state, pid, head + 1);
-          log(state, 'GC21 second chance: ' + head + ' → ' + P(state, pid).tile + ' (the tile ahead of the snake).');
+          var i21 = log(state, 'GC21 second chance: ' + head + ' → ' + P(state, pid).tile + ' (the tile ahead of the snake).', 'gc21');
+          milestone(state, 'snake_second_chance', { n: i21, pid: pid, from: head, to: P(state, pid).tile });
+          boardEvent = { cardId: 'gc21', title: 'GC21 — SECOND CHANCE', text: nameOf(state, pid) + ' avoided the snake at ' + head + ' and stepped ahead to tile ' + P(state, pid).tile + '.' };
           if (P(state, pid).tile >= 100) win(state, pid, 'GC21 put them on tile 100', false);
         } else if (state.flags.snakeMirror === pid) {
           delete state.flags.snakeMirror;
           setRawTile(state, pid, head + (head - tail));
-          log(state, 'GC15: the snake at ' + head + ' acts as a ladder — ' + head + ' → ' + P(state, pid).tile + '.');
+          var i15 = log(state, 'GC15: the snake at ' + head + ' acts as a ladder — ' + head + ' → ' + P(state, pid).tile + '.', 'gc15');
+          milestone(state, 'snake_mirror', { n: i15, pid: pid, from: head, to: P(state, pid).tile });
+          boardEvent = { cardId: 'gc15', title: 'GC15 — SNAKE MIRRORED', text: 'The snake at ' + head + ' acted as a ladder — ' + nameOf(state, pid) + ' climbed to tile ' + P(state, pid).tile + '.' };
           if (P(state, pid).tile >= 100) win(state, pid, 'GC15 mirrored a snake onto tile 100', false);
         } else {
           setRawTile(state, pid, tail);
-          log(state, nameOf(state, pid) + ' hit the snake at ' + head + ' → ' + tail + '.');
+          var sn = log(state, nameOf(state, pid) + ' hit the snake at ' + head + ' → ' + tail + '.');
+          milestone(state, 'snake', { n: sn, pid: pid, from: head, to: tail });
+          boardEvent = { title: 'SNAKE · ' + head + ' → ' + (tail < 0 ? '−' + Math.abs(tail) : tail), text: nameOf(state, pid) + ' slid down the snake from ' + head + ' to tile ' + (tail < 0 ? '−' + Math.abs(tail) : tail) + '.' };
         }
       } else if (LADDERS[head] != null) {
         setRawTile(state, pid, LADDERS[head]);
-        log(state, nameOf(state, pid) + ' climbed the ladder at ' + head + ' → ' + LADDERS[head] + '.');
+        var ln = log(state, nameOf(state, pid) + ' climbed the ladder at ' + head + ' → ' + LADDERS[head] + '.');
+        milestone(state, 'ladder', { n: ln, pid: pid, from: head, to: LADDERS[head] });
+        boardEvent = { title: 'LADDER · ' + head + ' → ' + LADDERS[head], text: nameOf(state, pid) + ' climbed the ladder from ' + head + ' to tile ' + LADDERS[head] + '.' };
       }
     }
     if (state.gameover) return;
@@ -319,10 +447,25 @@
     if (t >= 100) { win(state, pid, 'reached tile 100', false); return; }
     if (!checkedThirteen && sequenceStep(state, pid, t)) return;
 
+    if (boardEvent && !opts.noBoardBanner) {
+      pushBanner(state, {
+        kind: 'effect', cardId: boardEvent.cardId || null,
+        title: boardEvent.title, text: boardEvent.text,
+        actor: pid, pendingPids: [state.cfg.practiceBot && pid > 0 ? 0 : pid]
+      });
+    }
+
     if (t > 0 && t % 2 === 0) enqueueDraw(state, pid, 1);
     if (state.curses[t]) {
       var c = state.curses[t]; delete state.curses[t];
-      log(state, 'Tile ' + t + ' was cursed with ' + label(c.id) + '. It fires on ' + nameOf(state, pid) + '.', c.id);
+      var cn = log(state, 'Tile ' + t + ' was cursed with ' + label(c.id) + '. It fires on ' + nameOf(state, pid) + '.', c.id);
+      milestone(state, 'curse_hit', { n: cn, pid: pid, tile: t, cardId: c.id });
+      pushBanner(state, {
+        kind: 'effect', cardId: c.id, card: cardView(c),
+        title: 'CURSED TILE ' + t + ' — ' + label(c.id),
+        text: 'Tile ' + t + ' was cursed with ' + label(c.id) + '. It fires on ' + nameOf(state, pid) + '.',
+        actor: pid, pendingPids: [state.cfg.practiceBot && pid > 0 ? 0 : pid]
+      });
       state.queue.push({ t: 'apply', card: c, pid: pid, fromPid: 'curse' });
     }
   }
@@ -333,7 +476,7 @@
   }
   function advance(state) {
     var guard = 0;
-    while (state.queue.length && !state.gameover && !state.prompt && !state.reveal && guard++ < 600) {
+    while (state.queue.length && !state.gameover && !state.prompt && !state.reveal && !(state.banners && state.banners.length) && guard++ < 600) {
       var task = state.queue.shift();
       try { runTask(state, task); }
       catch (e) { log(state, 'Rules engine caught an error while resolving ' + (task.card ? label(task.card.id) : task.t) + ': ' + e.message); }
@@ -342,28 +485,88 @@
   function settle(state) {
     advance(state);
     if (state.gameover) { state.phase = 'gameover'; state.canEndTurn = false; return; }
-    if (!state.prompt && !state.reveal && !state.queue.length && state.rolledThisTurn) state.canEndTurn = true;
+    if (!state.prompt && !state.reveal && !(state.banners && state.banners.length) && !state.queue.length && state.rolledThisTurn) state.canEndTurn = true;
   }
   function runTask(state, task) {
     if (task.t === 'draw') return doDraw(state, task);
     if (task.t === 'card') return doCard(state, task);
     if (task.t === 'apply') return applyEffect(state, task.card, task.pid, task.fromPid);
+    if (task.t === 'banner') return pushBanner(state, task.banner);
+    if (task.t === 'gc19_prompt') {
+      setPrompt(state, { title: 'GC19 — place your bad card', text: 'Choose the top of any ladder. You move there instead of resolving ' + label(task.badCardId) + '.',
+        cardId: 'gc19', kind: 'options', multi: 0, data: { op: 'gc19_ladder', pid: task.pid },
+        options: LADDER_TOPS.map(function (t) { return { label: 'Tile ' + t, value: t }; }) });
+      return;
+    }
+    if (task.t === 'bc7_lose') return lose(state, task.pid, task.reason, false);
     if (task.t === 'instant_win') return win(state, task.pid, task.reason, true);
   }
   function doDraw(state, task) {
     var pid = task.pid, p = P(state, pid);
+    // Batch all consecutive queued draws for this player so multiple cards drawn at once are shown together.
+    var count = 1;
+    while (state.queue.length && state.queue[0].t === 'draw' && state.queue[0].pid === pid) {
+      state.queue.shift();
+      count++;
+    }
     if (!p.alive) return;
     if (hasCard(state, pid, 'bc2')) {
       log(state, nameOf(state, pid) + ' cannot draw cards while holding BC2.');
       return;
     }
-    var cards = takeFromDeck(state, 1);
+    var cards = takeFromDeck(state, count);
     if (!cards.length) { log(state, 'The deck is empty.'); return; }
-    var card = cards[0];
     p.drewThisTurn = true;
-    p.drawnTypes.push(typeOf(card.id));
-    if (p.drawnTypes.length > 12) p.drawnTypes.shift();
-    state.queue.unshift({ t: 'card', card: card, pid: pid, source: 'draw' });
+
+    var items = [];
+    var deferred = [];
+    cards.forEach(function (card) {
+      var id = card.id;
+      p.drawnTypes.push(typeOf(id));
+      if (p.drawnTypes.length > 12) p.drawnTypes.shift();
+
+      var pl = decide(state, card);
+      var ic = interceptors(state, card, pid, pl, deferred);
+      if (ic && ic.outcome === 'discard') {
+        discardCard(state, card);
+        items.push({
+          card: cardView(card), text: CARDS[id].text, kept: false, public: true,
+          jazz: false, statusNote: ic.note || 'INTERCEPTED'
+        });
+      } else if (ic && ic.outcome === 'transfer') {
+        items.push({
+          card: cardView(card), text: CARDS[id].text, kept: false, public: true,
+          jazz: false, statusNote: ic.note || 'TRANSFERRED'
+        });
+      } else {
+        if (pl.hand) {
+          card.sticky = pl.sticky; card.playable = pl.playable; card.passive = pl.passive;
+          addHand(state, pid, card);
+        } else {
+          discardCard(state, card);
+        }
+        // Kept cards stay secret: only the drawing player sees the card face.
+        log(state, nameOf(state, pid) + ' drew a ' + typeOf(id).toLowerCase() + ' card' +
+          (pl.hand ? ' (kept in hand)' : ' — ' + label(id) + ' (played immediately)') + '.', pl.hand ? null : id);
+        items.push({
+          card: cardView(card), text: CARDS[id].text, kept: pl.hand, public: !pl.hand,
+          jazz: id === 'gc25', statusNote: pl.hand ? 'KEPT IN HAND' : 'PLAYED IMMEDIATELY'
+        });
+        if (pl.resolveNow) deferred.push({ t: 'apply', card: card, pid: pid, fromPid: null });
+      }
+    });
+
+    if (!items.length) return;
+    state.reveal = {
+      card: items[0].card,
+      cards: items,
+      pid: pid,
+      public: items.some(function (x) { return x.public; }),
+      text: items[0].text,
+      jazz: items.some(function (x) { return x.jazz; }),
+      kept: items.every(function (x) { return x.kept; })
+    };
+    for (var j = deferred.length - 1; j >= 0; j--) state.queue.unshift(deferred[j]);
   }
 
   function decide(state, card) {
@@ -381,63 +584,93 @@
   }
 
   function doCard(state, task) {
-    var card = task.card, pid = task.pid, p = P(state, pid), id = card.id;
+    var card = task.card, pid = task.pid, id = card.id;
     if (task.source !== 'draw') {
       state.queue.unshift({ t: 'apply', card: card, pid: pid, fromPid: task.fromPid });
       return;
     }
     var pl = decide(state, card);
-    var consumed = interceptors(state, card, pid, pl);
-    if (consumed === 'discard') { discardCard(state, card); return; }
-    if (consumed === 'transfer') return;
+    var deferred = [];
+    var ic = interceptors(state, card, pid, pl, deferred);
+    if (ic && ic.outcome === 'discard') {
+      discardCard(state, card);
+      for (var d1 = deferred.length - 1; d1 >= 0; d1--) state.queue.unshift(deferred[d1]);
+      return;
+    }
+    if (ic && ic.outcome === 'transfer') {
+      for (var d2 = deferred.length - 1; d2 >= 0; d2--) state.queue.unshift(deferred[d2]);
+      return;
+    }
     if (pl.hand) {
       card.sticky = pl.sticky; card.playable = pl.playable; card.passive = pl.passive;
       addHand(state, pid, card);
     } else {
       discardCard(state, card);
     }
-    // Kept cards stay secret: only the drawing player sees the card face.
     log(state, nameOf(state, pid) + ' drew a ' + typeOf(id).toLowerCase() + ' card' +
       (pl.hand ? ' (kept in hand)' : ' — ' + label(id) + ' (played immediately)') + '.', pl.hand ? null : id);
+    var item = { card: cardView(card), text: CARDS[id].text, kept: pl.hand, public: !pl.hand, jazz: id === 'gc25', statusNote: pl.hand ? 'KEPT IN HAND' : 'PLAYED IMMEDIATELY' };
     state.reveal = {
-      card: cardView(card), pid: pid, public: !pl.hand,
+      card: item.card, cards: [item], pid: pid, public: !pl.hand,
       text: CARDS[id].text, jazz: id === 'gc25', kept: pl.hand
     };
-    if (pl.resolveNow) state.queue.unshift({ t: 'apply', card: card, pid: pid, fromPid: null });
+    if (pl.resolveNow) deferred.push({ t: 'apply', card: card, pid: pid, fromPid: null });
+    for (var j = deferred.length - 1; j >= 0; j--) state.queue.unshift(deferred[j]);
   }
 
-  function interceptors(state, card, pid, pl) {
+  function interceptors(state, card, pid, pl, deferred) {
     var id = card.id, ty = typeOf(id), p = P(state, pid);
+    deferred = deferred || state.queue;
 
     if (state.flags.negateNextCard != null) {
       var by = state.flags.negateNextCard; delete state.flags.negateNextCard;
-      log(state, label(id) + ' was negated by VC32 (held by ' + nameOf(state, by) + ').', id);
-      return 'discard';
+      var nn = log(state, label(id) + ' was negated by VC32 (held by ' + nameOf(state, by) + ').', id);
+      milestone(state, 'vc32_negate', { n: nn, pid: by, cardId: id });
+      deferred.push({ t: 'banner', banner: {
+        kind: 'effect', cardId: 'vc32', card: cardView(card),
+        title: 'VC32 — CARD NEGATED',
+        text: label(id) + ' drawn by ' + nameOf(state, pid) + ' was negated by VC32 (held by ' + nameOf(state, by) + ').',
+        actor: by, pendingPids: state.cfg.practiceBot ? [0] : (by !== pid ? [pid, by] : [pid])
+      } });
+      return { outcome: 'discard', note: 'NEGATED BY VC32' };
     }
     if (ty === 'Bad' && p.status.badImmuneRolls > 0 && state.rolledThisTurn) {
       p.status.badImmuneRolls--;
       log(state, nameOf(state, pid) + ' is immune to bad cards on this roll (GC2). ' + label(id) + ' fizzles.', id);
-      return 'discard';
+      return { outcome: 'discard', note: 'BLOCKED BY GC2' };
     }
     if (state.flags.nextDrawGiveTo != null && state.flags.nextDrawGiveTo !== pid) {
       var owner = state.flags.nextDrawGiveTo; delete state.flags.nextDrawGiveTo;
       addHand(state, owner, card);
-      log(state, 'VC12: ' + nameOf(state, pid) + ' must hand their card to ' + nameOf(state, owner) + '.', id);
-      return 'transfer';
+      var v12n = log(state, 'VC12: ' + nameOf(state, pid) + ' must hand their card to ' + nameOf(state, owner) + '.', id);
+      milestone(state, 'steal', { n: v12n, pid: owner, target: pid, cardId: 'vc12' });
+      deferred.push({ t: 'banner', banner: {
+        kind: 'card', cardId: 'vc12', card: cardView(card), private: true,
+        title: 'VC12 — CARD RECEIVED',
+        text: nameOf(state, pid) + ' drew a card and had to hand ' + label(id) + ' to ' + nameOf(state, owner) + '.',
+        actor: pid, pendingPids: [owner]
+      } });
+      return { outcome: 'transfer', note: 'GIVEN TO ' + nameOf(state, owner).toUpperCase() + ' (VC12)' };
     }
     if (p.status.nextCardGiveToNext) {
       p.status.nextCardGiveToNext = false;
       var tgt = nextAliveSeat(state, pid);
       transferCard(state, pid, tgt, card);
       log(state, 'VC14: the card goes to ' + nameOf(state, tgt) + '; ' + nameOf(state, pid) + ' draws another.', id);
+      deferred.push({ t: 'banner', banner: {
+        kind: 'card', cardId: 'vc14', card: cardView(card), private: true,
+        title: 'VC14 — CARD PASSED TO YOU',
+        text: nameOf(state, pid) + ' passed ' + label(id) + ' to ' + nameOf(state, tgt) + '.',
+        actor: pid, pendingPids: [tgt]
+      } });
       enqueueDraw(state, pid, 1);
-      return 'transfer';
+      return { outcome: 'transfer', note: 'PASSED TO ' + nameOf(state, tgt).toUpperCase() + ' (VC14)' };
     }
     if (p.status.nextCardType) {
       var req = p.status.nextCardType; p.status.nextCardType = null;
       if (ty !== req.type) {
         log(state, 'The next card was ' + ty + ', not ' + req.type + '. ' + nameOf(state, pid) + ' pays the price.');
-        if (req.fail === 'lose') lose(state, pid, 'failed a card-type prediction', false);
+        if (req.fail === 'lose') deferred.push({ t: 'bc7_lose', pid: pid, reason: 'failed a card-type prediction' });
         else if (req.fail === 'nemo') toNemo(state, pid);
         else setTile(state, pid, 1, { landing: false });
       } else log(state, 'The card-type prediction was right (' + req.type + ').');
@@ -445,40 +678,40 @@
     if (hasCard(state, pid, 'bc7') || (id === 'bc7' && pl.hand)) {
       var d = p.drawnTypes;
       if (d.length >= 2 && d[d.length - 1] === d[d.length - 2]) {
-        lose(state, pid, 'drew the same card type twice in a row while holding BC7', false);
+        deferred.push({ t: 'bc7_lose', pid: pid, reason: 'drew the same card type twice in a row while holding BC7' });
       }
     }
     if (ty === 'Bad' && state.flags.nextBadToLadderTop === pid) {
       delete state.flags.nextBadToLadderTop;
       log(state, 'GC19: the bad card is placed at the top of a ladder instead of taking effect.', id);
-      setPrompt(state, { title: 'GC19 — place your bad card', text: 'Choose the top of any ladder. You move there instead of resolving ' + label(id) + '.',
-        cardId: 'gc19', kind: 'options', multi: 0, data: { op: 'gc19_ladder', pid: pid },
-        options: LADDER_TOPS.map(function (t) { return { label: 'Tile ' + t, value: t }; }) });
-      return 'discard';
+      deferred.push({ t: 'gc19_prompt', pid: pid, badCardId: id });
+      return { outcome: 'discard', note: 'REPLACED BY GC19 LADDER' };
     }
     if (ty === 'Bad' && p.status.curseTile != null) {
       var t = p.status.curseTile; p.status.curseTile = null;
       state.curses[t] = card;
       log(state, 'GC12: tile ' + t + ' is now cursed with ' + label(id) + '.', id);
-      return 'discard';
+      return { outcome: 'discard', note: 'CURSED ONTO TILE ' + t + ' (GC12)' };
     }
     if (id === 'gc10') {
       var guard = state.players.find(function (q) { return q.i !== pid && q.alive && hasCard(state, q.i, 'gc11'); });
       if (guard) {
-        log(state, 'GC11 (held by ' + nameOf(state, guard.i) + '): ' + nameOf(state, pid) + ' is sent to the start instead of winning.', id);
+        var g11 = log(state, 'GC11 (held by ' + nameOf(state, guard.i) + '): ' + nameOf(state, pid) + ' is sent to the start instead of winning.', id);
+        milestone(state, 'gc11_block', { n: g11, pid: guard.i, target: pid });
         setTile(state, pid, 1, { landing: false });
-        return 'discard';
+        return { outcome: 'discard', note: 'BLOCKED BY GC11' };
       }
     }
     if (INSTANT_RESULT.indexOf(id) >= 0 && instantBlocked(state)) {
-      log(state, 'VC25 blocks the instant result on ' + label(id) + '.', id);
-      return 'discard';
+      var v25 = log(state, 'VC25 blocks the instant result on ' + label(id) + '.', id);
+      milestone(state, 'vc25_block', { n: v25, pid: pid, cardId: id });
+      return { outcome: 'discard', note: 'BLOCKED BY VC25' };
     }
     if ((id === 'vc34' || id === 'vc35') && pl.hand) {
       var other = id === 'vc34' ? 'vc35' : 'vc34';
       if (hasCard(state, pid, other)) {
         log(state, 'Both variants are in hand — ' + label(id) + ' + ' + label(other) + '.', id);
-        state.queue.push({ t: 'instant_win', pid: pid, reason: 'both VC34 and VC35 variants' });
+        deferred.push({ t: 'instant_win', pid: pid, reason: 'both VC34 and VC35 variants' });
       }
     }
     return null;
@@ -523,12 +756,22 @@
     var pid = pr.data.pid == null ? pr.forPid : pr.data.pid;
     var op = pr.data.op, p = P(state, pid);
     var selected = function (uid) { return pluckCard(state, pid, uid); };
+    var bannersBefore = (state.banners || []).length;
     switch (op) {
       case 'outcome':
         if (value === 'fail') {
           if (pr.data.fail === 'lose') lose(state, pid, 'failed a table call', false);
-          else if (pr.data.fail === 'nemo') toNemo(state, pid);
-          else if (pr.data.fail === 'start') setTile(state, pid, 1, { landing: false });
+          else if (pr.data.fail === 'nemo') {
+            toNemo(state, pid, pr.cardId);
+            pushBanner(state, { kind: 'effect', cardId: pr.cardId, title: label(pr.cardId) + ' — TO POINT NEMO',
+              text: nameOf(state, pid) + ' failed the table call and went to Point Nemo (tile −1).',
+              actor: pid, pendingPids: [state.cfg.practiceBot && pid > 0 ? 0 : pid] });
+          } else if (pr.data.fail === 'start') {
+            setTile(state, pid, 1, { landing: false });
+            pushBanner(state, { kind: 'effect', cardId: pr.cardId, title: label(pr.cardId) + ' — BACK TO START',
+              text: nameOf(state, pid) + ' failed the table call and returned to tile 1.',
+              actor: pid, pendingPids: [state.cfg.practiceBot && pid > 0 ? 0 : pid] });
+          }
         } else log(state, nameOf(state, pid) + ' succeeded. Nothing else happens.');
         break;
       case 'choice':
@@ -543,13 +786,21 @@
           }
           case 'bc23_back': case 'bc24_back': back(state, pid, 4, null); break;
           case 'bc24_take': {
+            var victims24 = [];
             state.players.forEach(function (q) {
               if (q.i === pid || !q.alive) return;
-              q.hand.filter(function (c) { return typeOf(c.id) === 'Bad'; }).forEach(function (c) {
+              var bads = q.hand.filter(function (c) { return typeOf(c.id) === 'Bad'; });
+              if (bads.length) victims24.push(q.i);
+              bads.forEach(function (c) {
                 pluckCard(state, q.i, c.uid); transferCard(state, q.i, pid, c);
               });
             });
             log(state, nameOf(state, pid) + ' takes everyone’s Bad cards.');
+            if (victims24.length) {
+              pushBanner(state, { kind: 'effect', cardId: 'bc24', title: 'BC24 — BAD CARDS TAKEN',
+                text: nameOf(state, pid) + ' took everyone’s Bad cards.',
+                actor: pid, pendingPids: state.cfg.practiceBot ? [0] : victims24 });
+            }
             break;
           }
         }
@@ -566,13 +817,22 @@
       case 'bc26_type':
         p.status.nextCardType = { type: value, fail: 'start' };
         log(state, 'The table called “' + value + '”. If the next card is not ' + value + ', ' + nameOf(state, pid) + ' goes to the start.');
+        pushBanner(state, { kind: 'effect', cardId: 'bc26', title: 'BC26 — TYPE CALLED: ' + value.toUpperCase(),
+          text: nameOf(state, pr.data.target) + ' called “' + value + '”. If ' + nameOf(state, pid) + '’s next card is not ' + value + ', they go back to tile 1.',
+          actor: pr.data.target, pendingPids: [state.cfg.practiceBot && pid > 0 ? 0 : pid] });
         break;
       case 'bc9_target': case 'bc10_target': {
         var need = op === 'bc9_target' ? 2 : 1;
+        var card910 = op === 'bc9_target' ? 'bc9' : 'bc10';
         var give = handGood(state, pid);
-        if (give.length < need) { log(state, 'Not enough Good cards — ' + label(op === 'bc9_target' ? 'bc9' : 'bc10') + ' is discarded.'); break; }
-        give.slice(0, need).forEach(function (c) { selected(c.uid); transferCard(state, pid, value, c); });
+        if (give.length < need) { log(state, 'Not enough Good cards — ' + label(card910) + ' is discarded.'); break; }
+        var sent910 = give.slice(0, need);
+        sent910.forEach(function (c) { selected(c.uid); transferCard(state, pid, value, c); });
         log(state, nameOf(state, pid) + ' gives ' + need + ' Good card(s) to ' + nameOf(state, value) + '.');
+        pushBanner(state, { kind: 'card', cardId: card910, cards: sent910.map(cardView), private: true,
+          title: label(card910) + ' — CARDS RECEIVED',
+          text: nameOf(state, pid) + ' gave ' + sent910.map(function (c) { return label(c.id); }).join(' & ') + ' to ' + nameOf(state, value) + '.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
         break;
       }
       case 'bc11_target':
@@ -580,11 +840,21 @@
         lose(state, value, 'chosen by BC11', false);
         lose(state, pid, 'BC11', false);
         break;
-      case 'gc3_target': setTile(state, value, 1, { landing: true }); log(state, nameOf(state, value) + ' is sent to the start.'); break;
+      case 'gc3_target':
+        setTile(state, value, 1, { landing: true });
+        log(state, nameOf(state, value) + ' is sent to the start.');
+        pushBanner(state, { kind: 'effect', cardId: 'gc3', title: 'GC3 — SENT TO START',
+          text: nameOf(state, pid) + ' played GC3 and sent ' + nameOf(state, value) + ' back to tile 1.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+        break;
       case 'gc5_target': {
         var a = p.tile, b = P(state, value).tile;
         setRawTile(state, pid, b); setRawTile(state, value, a);
-        log(state, nameOf(state, pid) + ' swaps tiles with ' + nameOf(state, value) + '.');
+        var s5 = log(state, nameOf(state, pid) + ' swaps tiles with ' + nameOf(state, value) + '.', 'gc5');
+        milestone(state, 'swap', { n: s5, pid: pid, target: value, cardId: 'gc5' });
+        pushBanner(state, { kind: 'effect', cardId: 'gc5', title: 'GC5 — TILES SWAPPED',
+          text: nameOf(state, pid) + ' swapped tiles with ' + nameOf(state, value) + ' (' + nameOf(state, value) + ' is now on tile ' + a + ').',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
         break;
       }
       case 'gc7_tile': setTile(state, pid, Number(value), { landing: true }); break;
@@ -594,11 +864,41 @@
         else { log(state, nameOf(state, pid) + ' moves vertically ' + value + ' to tile ' + t2 + '.'); setTile(state, pid, t2, { landing: true }); }
         break;
       }
-      case 'gc16_target': P(state, value).status.skipTurns += 1; log(state, nameOf(state, value) + ' is immobile for a turn.'); break;
+      case 'gc16_target':
+        P(state, value).status.skipTurns += 1;
+        log(state, nameOf(state, value) + ' is immobile for a turn.');
+        pushBanner(state, { kind: 'effect', cardId: 'gc16', title: 'GC16 — IMMOBILE NEXT TURN',
+          text: nameOf(state, pid) + ' played GC16 — ' + nameOf(state, value) + ' misses their next turn.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+        break;
       case 'gc19_ladder': setTile(state, pid, Number(value), { landing: true }); log(state, nameOf(state, pid) + ' goes to ladder top ' + value + '.'); break;
-      case 'gc23_target': back(state, value, 2, pid); break;
-      case 'gc30_target': P(state, value).status.extraRolls += 1; log(state, nameOf(state, value) + ' is forced to roll an extra time on their next turn.'); break;
-      case 'gc34_target': back(state, value, 10, pid); break;
+      case 'gc23_target': {
+        var b23 = (state.banners || []).length;
+        back(state, value, 2, pid);
+        if ((state.banners || []).length === b23 && !state.gameover) {
+          pushBanner(state, { kind: 'effect', cardId: 'gc23', title: 'GC23 — DRAGGED BACK 2',
+            text: nameOf(state, pid) + ' played GC23 and dragged ' + nameOf(state, value) + ' back 2 spaces to tile ' + P(state, value).tile + '.',
+            actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+        }
+        break;
+      }
+      case 'gc30_target':
+        P(state, value).status.extraRolls += 1;
+        log(state, nameOf(state, value) + ' is forced to roll an extra time on their next turn.');
+        pushBanner(state, { kind: 'effect', cardId: 'gc30', title: 'GC30 — EXTRA ROLL FORCED',
+          text: nameOf(state, pid) + ' played GC30 — ' + nameOf(state, value) + ' must roll an extra time on their next turn.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+        break;
+      case 'gc34_target': {
+        var b34 = (state.banners || []).length;
+        back(state, value, 10, pid);
+        if ((state.banners || []).length === b34 && !state.gameover) {
+          pushBanner(state, { kind: 'effect', cardId: 'gc34', title: 'GC34 — DRAGGED BACK 10',
+            text: nameOf(state, pid) + ' played GC34 and dragged ' + nameOf(state, value) + ' back 10 spaces to tile ' + P(state, value).tile + '.',
+            actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+        }
+        break;
+      }
       case 'gc36_tile': setTile(state, pid, Number(value), { landing: true }); break;
       case 'vc1_target': {
         var opts1 = cardOptions(state, pid);
@@ -611,6 +911,10 @@
         var c1 = selected(value); if (!c1) break;
         transferCard(state, pid, pr.data.target, c1);
         log(state, nameOf(state, pid) + ' gives ' + label(c1.id) + ' to ' + nameOf(state, pr.data.target) + '.', c1.id);
+        pushBanner(state, { kind: 'card', cardId: 'vc1', card: cardView(c1), private: true,
+          title: 'VC1 — CARD RECEIVED',
+          text: nameOf(state, pid) + ' gave ' + label(c1.id) + ' to ' + nameOf(state, pr.data.target) + '.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && pr.data.target > 0 ? 0 : pr.data.target] });
         break;
       }
       case 'vc6_target': {
@@ -626,6 +930,9 @@
         var c6 = selected(value); if (!c6) break;
         discardCard(state, c6);
         log(state, nameOf(state, pid) + ' pays ' + label(c6.id) + ' to look at ' + nameOf(state, pr.data.target) + '’s cards.', c6.id);
+        pushBanner(state, { kind: 'effect', cardId: 'vc6', title: 'VC6 — YOUR HAND WAS VIEWED',
+          text: nameOf(state, pid) + ' paid ' + label(c6.id) + ' to look at ' + nameOf(state, pr.data.target) + '’s cards.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && pr.data.target > 0 ? 0 : pr.data.target] });
         break;
       }
       case 'vc7_forfeit': {
@@ -647,10 +954,21 @@
         var hA = P(state, pid).hand.splice(0), hB = P(state, value).hand.splice(0);
         hA.forEach(function (c) { transferCard(state, pid, value, c); });
         hB.forEach(function (c) { transferCard(state, value, pid, c); });
-        log(state, nameOf(state, pid) + ' swaps hands with ' + nameOf(state, value) + '.');
+        var s26 = log(state, nameOf(state, pid) + ' swaps hands with ' + nameOf(state, value) + '.', 'vc26');
+        milestone(state, 'steal', { n: s26, pid: pid, target: value, cardId: 'vc26' });
+        pushBanner(state, { kind: 'card', cardId: 'vc26', cards: hA.map(cardView), private: true,
+          title: 'VC26 — HANDS SWAPPED',
+          text: nameOf(state, pid) + ' swapped hands with ' + nameOf(state, value) + '. Received ' + hA.length + ' card(s).',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
         break;
       }
-      case 'vc31_target': enqueueDraw(state, value, 1); log(state, nameOf(state, value) + ' must draw a card.'); break;
+      case 'vc31_target':
+        log(state, nameOf(state, value) + ' must draw a card.');
+        pushBanner(state, { kind: 'effect', cardId: 'vc31', title: 'VC31 — DRAW A CARD',
+          text: nameOf(state, pid) + ' played VC31 — ' + nameOf(state, value) + ' must draw a card.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+        enqueueDraw(state, value, 1);
+        break;
       case 'vc33_target': {
         var opts33 = cardOptions(state, value);
         if (!opts33.length) { log(state, nameOf(state, value) + ' has no cards to discard.'); break; }
@@ -660,11 +978,32 @@
       }
       case 'vc33_card': {
         var c33 = pluckCard(state, pr.data.target, value);
-        if (c33) { discardCard(state, c33); log(state, label(c33.id) + ' is discarded from ' + nameOf(state, pr.data.target) + '’s hand.', c33.id); }
+        if (c33) {
+          discardCard(state, c33);
+          log(state, label(c33.id) + ' is discarded from ' + nameOf(state, pr.data.target) + '’s hand.', c33.id);
+          pushBanner(state, { kind: 'effect', cardId: 'vc33', card: cardView(c33),
+            title: 'VC33 — CARD DISCARDED',
+            text: nameOf(state, pid) + ' discarded ' + label(c33.id) + ' from ' + nameOf(state, pr.data.target) + '’s hand.',
+            actor: pid, pendingPids: [state.cfg.practiceBot && pr.data.target > 0 ? 0 : pr.data.target] });
+        }
         break;
       }
-      case 'vc36_target': discardHand(state, value); log(state, nameOf(state, value) + ' discards their whole hand.'); break;
+      case 'vc36_target':
+        discardHand(state, value);
+        log(state, nameOf(state, value) + ' discards their whole hand.');
+        pushBanner(state, { kind: 'effect', cardId: 'vc36', title: 'VC36 — HAND DISCARDED',
+          text: nameOf(state, pid) + ' played VC36 — ' + nameOf(state, value) + ' discarded their entire hand.',
+          actor: pid, pendingPids: [state.cfg.practiceBot && value > 0 ? 0 : value] });
+        break;
       default: log(state, 'Unhandled choice: ' + op);
+    }
+    // If another card effect is still waiting in queue after resolving this prompt, pause for the owner before moving on.
+    if (!state.gameover && !state.prompt && !state.reveal && (state.banners || []).length === bannersBefore &&
+        state.queue.some(function (x) { return x.t === 'apply'; })) {
+      pushBanner(state, { kind: 'effect', cardId: pr.cardId || null,
+        title: (pr.cardId ? label(pr.cardId) : 'CARD') + ' RESOLVED',
+        text: pr.cardId && CARDS[pr.cardId] ? CARDS[pr.cardId].text : 'Effect resolved.',
+        actor: pid, pendingPids: [state.cfg.practiceBot && pid > 0 ? 0 : pid] });
     }
   }
 
@@ -722,10 +1061,11 @@
 
   function applyEffect(state, card, pid, fromPid) {
     if (state.gameover || !P(state, pid).alive) return;
-    var id = card.id, p = P(state, pid), n = N(state);
+    var id = card.id, p = P(state, pid);
     var nxt = nextAliveSeat(state, pid);
     var aliveCount = state.players.filter(function (q) { return q.alive; }).length;
-    log(state, label(id) + ': ' + (CARDS[id] ? CARDS[id].text : 'engine effect'), id);
+    var bannersBefore = (state.banners || []).length;
+    var effLogN = log(state, label(id) + ': ' + (CARDS[id] ? CARDS[id].text : 'engine effect'), id);
 
     // GC20: a bad card used against you still takes effect, but you also move five ahead.
     if (typeOf(id) === 'Bad' && fromPid != null && fromPid !== pid && typeof fromPid === 'number' && hasCard(state, pid, 'gc20')) {
@@ -736,7 +1076,12 @@
       /* ---------------- BAD ---------------- */
       case 'bc1': promptOutcome(state, pid, id, 'Guess the forecast of Manila for the next hour. The table decides whether you got it right.', 'nemo'); break;
       case 'bc2': log(state, 'BC2 stays in your hand: you cannot draw cards while it is there.'); break;
-      case 'bc3': log(state, 'Table call: buy food for ' + nameOf(state, nxt) + '.'); break;
+      case 'bc3':
+        log(state, 'Table call: buy food for ' + nameOf(state, nxt) + '.');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'BC3 — TABLE CALL', text: nameOf(state, pid) + ' must buy food for ' + nameOf(state, nxt) + '.',
+          actor: pid, pendingPids: state.cfg.practiceBot ? [0] : (nxt !== pid ? [nxt, pid] : [pid]) });
+        break;
       case 'bc4': p.status.needSix = true; log(state, 'Your next roll must be a 6, or Point Nemo.'); break;
       case 'bc5': promptOutcome(state, pid, id, 'Solve today’s Wordle and tell the table the answer.', 'lose'); break;
       case 'bc6': promptOutcome(state, pid, id, 'Solve today’s Wordle and tell the table the answer.', 'nemo'); break;
@@ -745,9 +1090,9 @@
         var two = takeFromDeck(state, 2);
         if (two.length < 2) { two.forEach(function (c) { state.deck.push(c); }); log(state, 'Not enough cards in the deck.'); break; }
         p.drawnTypes.push(typeOf(two[0].id), typeOf(two[1].id));
-        setPrompt(state, { title: 'BC8 — take the objectively worse one', text: 'The table decides which of these two is worse. The other goes back into the deck, which is reshuffled.',
+        setPrompt(state, { title: 'BC8 — take the objectively worse one', text: 'Both cards were drawn. The table decides which is worse; the other goes back into the deck.',
           cardId: 'bc8', kind: 'cards', multi: 0, data: { op: 'bc8_worse', pid: pid, cards: two },
-          options: two.map(function (c) { return { label: label(c.id) + ' · ' + CARDS[c.id].text.slice(0, 40), value: c.uid, img: CARDS[c.id].img }; }) });
+          options: two.map(function (c) { return { label: label(c.id) + ' · ' + CARDS[c.id].text, value: c.uid, img: CARDS[c.id].img }; }) });
         break;
       }
       case 'bc9': case 'bc10': {
@@ -762,7 +1107,13 @@
         promptPlayers(state, { title: 'BC11 — choose someone to lose with you', text: 'You lose, and so does the player you choose.',
           cardId: id, data: { op: 'bc11_target' } });
         break;
-      case 'bc12': discardEveryoneGood(state); log(state, 'Everyone loses their Good cards.'); break;
+      case 'bc12':
+        discardEveryoneGood(state);
+        log(state, 'Everyone loses their Good cards.');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'BC12 — ALL GOOD CARDS DISCARDED', text: 'Everyone discards all Good cards in hand.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'bc13': setTile(state, pid, 1, { landing: true }); break;
       case 'bc14': log(state, 'BC14 stays in your hand: every roll is reduced by 1.'); break;
       case 'bc15': setTile(state, pid, p.prevTile - p.lastRoll, { landing: true }); break;
@@ -771,7 +1122,7 @@
       case 'bc18': p.status.skipUntilRound = state.round + 2; log(state, 'No rolling for two rounds.'); break;
       case 'bc19': p.status.skipUntilRound = state.round + 1; log(state, 'No rolling for a round.'); break;
       case 'bc20': setTile(state, pid, Math.ceil(p.tile / 2), { landing: true }); break;
-      case 'bc21': toNemo(state, pid); break;
+      case 'bc21': toNemo(state, pid, id); break;
       case 'bc22': {
         var good22 = handGood(state, pid).length;
         promptChoice(state, pid, id, 'Discard all Good cards in your possession, or lose. Having none also means you lose.',
@@ -790,7 +1141,13 @@
         promptChoice(state, pid, id, 'Take everyone’s Bad cards, or move back four spaces.',
           [{ label: 'Take everyone’s Bad cards', value: 'bc24_take' }, { label: 'Move back four spaces', value: 'bc24_back' }]);
         break;
-      case 'bc25': everyoneTo(state, 1); break;
+      case 'bc25':
+        everyoneTo(state, 1);
+        milestone(state, 'warp', { n: effLogN, pid: pid, tile: 1, cardId: id });
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'BC25 — EVERYONE TO TILE 1', text: nameOf(state, pid) + ' drew BC25 — everyone returns to tile 1!',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'bc26': {
         var bc26Next = nextAliveSeat(state, pid);
         setPrompt(state, { title: 'BC26 — the next player calls a card type', text: 'Call a card type for ' + nameOf(state, pid) + '. If their next card is not that type, they go to the start.',
@@ -806,8 +1163,24 @@
       case 'bc32': back(state, pid, 8, null); break;
       case 'bc33': back(state, pid, 6, null); break;
       case 'bc34': back(state, pid, 2, null); break;
-      case 'bc35': state.watchers.push({ owner: pid, target: nxt, requireDraw: false }); log(state, 'If ' + nameOf(state, nxt) + ' does not draw a card on their turn, you go to Point Nemo.'); break;
-      case 'bc36': state.watchers.push({ owner: pid, target: nxt, requireDraw: true }); log(state, 'If ' + nameOf(state, nxt) + ' draws a card on their turn, you go to Point Nemo.'); break;
+      case 'bc35':
+        state.watchers.push({ owner: pid, target: nxt, requireDraw: false });
+        log(state, 'If ' + nameOf(state, nxt) + ' does not draw a card on their turn, you go to Point Nemo.');
+        if (nxt !== pid) {
+          pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+            title: 'BC35 — WATCHING NEXT TURN', text: 'If ' + nameOf(state, nxt) + ' does not draw a card on their next turn, ' + nameOf(state, pid) + ' goes to Point Nemo.',
+            actor: pid, pendingPids: state.cfg.practiceBot ? [0] : [nxt] });
+        }
+        break;
+      case 'bc36':
+        state.watchers.push({ owner: pid, target: nxt, requireDraw: true });
+        log(state, 'If ' + nameOf(state, nxt) + ' draws a card on their turn, you go to Point Nemo.');
+        if (nxt !== pid) {
+          pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+            title: 'BC36 — WATCHING NEXT TURN', text: 'If ' + nameOf(state, nxt) + ' draws a card on their next turn, ' + nameOf(state, pid) + ' goes to Point Nemo.',
+            actor: pid, pendingPids: state.cfg.practiceBot ? [0] : [nxt] });
+        }
+        break;
 
       /* ---------------- GOOD ---------------- */
       case 'gc1': forward(state, pid, 3); break;
@@ -835,17 +1208,9 @@
         setTile(state, pid, base, { landing: true });
         break;
       }
-      case 'gc10': {
-        if (instantBlocked(state)) { log(state, 'VC25 blocks the instant result on GC10.', id); break; }
-        var gc11 = state.players.find(function (q) { return q.i !== pid && q.alive && hasCard(state, q.i, 'gc11'); });
-        if (gc11) {
-          log(state, 'GC11 (held by ' + nameOf(state, gc11.i) + '): ' + nameOf(state, pid) + ' is sent to the start instead of winning.', id);
-          setTile(state, pid, 1, { landing: false });
-          break;
-        }
+      case 'gc10':
         win(state, pid, 'GC10 — You win.', true);
         break;
-      }
       case 'gc12': p.status.curseTile = p.tile; log(state, 'Tile ' + p.tile + ' will be cursed with the next Bad card you draw.'); break;
       case 'gc14': {
         var up = verticalTile(p.tile, 'up'), down = verticalTile(p.tile, 'down');
@@ -858,25 +1223,57 @@
       case 'gc15': state.flags.snakeMirror = pid; log(state, 'The next snake you come across will act as a ladder.'); break;
       case 'gc16': promptPlayers(state, { title: 'GC16 — make someone immobile', text: 'Choose a player to skip their next turn.', cardId: id, data: { op: 'gc16_target' } }); break;
       case 'gc17': setTile(state, pid, p.prevTile, { landing: true }); p.status.extraRolls += 1; log(state, 'Return to your last tile, then roll again.'); break;
-      case 'gc18': forwardEveryone(state, 1); break;
+      case 'gc18':
+        forwardEveryone(state, 1);
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'GC18 — EVERYONE +1 SPACE', text: nameOf(state, pid) + ' played GC18 — everyone moves forward 1 space.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'gc19': state.flags.nextBadToLadderTop = pid; log(state, 'Your next Bad card goes to the top of a ladder instead of resolving.'); break;
-      case 'gc22': clearRules(state); break;
+      case 'gc22':
+        clearRules(state);
+        milestone(state, 'clear', { n: effLogN, pid: pid });
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'GC22 — ALL RULES CLEARED', text: nameOf(state, pid) + ' played GC22 — every card rule, status, and curse is removed.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'gc23': promptPlayers(state, { title: 'GC23 — drag someone back two', text: 'Choose a player ahead of you.', cardId: id,
         data: { op: 'gc23_target' }, filter: function (q) { return q.tile > p.tile; }, emptyText: 'No one is ahead — nothing happens.' }); break;
       case 'gc25': state.jazzCue = true; log(state, 'Play jazz. Immediately.'); break;
-      case 'gc26': log(state, 'Table call: ' + nameOf(state, nxt) + ' has to buy you food.'); break;
+      case 'gc26':
+        log(state, 'Table call: ' + nameOf(state, nxt) + ' has to buy you food.');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'GC26 — TABLE CALL', text: nameOf(state, nxt) + ' has to buy ' + nameOf(state, pid) + ' food.',
+          actor: pid, pendingPids: state.cfg.practiceBot ? [0] : (nxt !== pid ? [nxt, pid] : [pid]) });
+        break;
       case 'gc27':
         state.flags.snakeImmunityBanned = true;
         state.players.forEach(function (q) { q.hand.filter(function (c) { return c.id === 'gc8'; }).forEach(function (c) { pluckCard(state, q.i, c.uid); discardCard(state, c); }); });
         log(state, 'No one can ever be immune to snakes again. Ever.');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'GC27 — NO SNAKE IMMUNITY', text: 'No one can ever be immune to snakes again. Any GC8 in hand is discarded.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
         break;
-      case 'gc28': P(state, nxt).status.skipTurns += 1; log(state, nameOf(state, nxt) + ' misses their next turn.'); break;
+      case 'gc28':
+        P(state, nxt).status.skipTurns += 1;
+        log(state, nameOf(state, nxt) + ' misses their next turn.');
+        if (nxt !== pid) {
+          pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+            title: 'GC28 — TURN SKIPPED', text: nameOf(state, pid) + ' played GC28 — ' + nameOf(state, nxt) + ' misses their next turn.',
+            actor: pid, pendingPids: [state.cfg.practiceBot && nxt > 0 ? 0 : nxt] });
+        }
+        break;
       case 'gc29': {
         var h29 = P(state, nxt).hand;
         if (!h29.length) { log(state, nameOf(state, nxt) + ' has no cards to steal.'); break; }
         var stolen = pluckCard(state, nxt, h29[ri(h29.length)].uid);
+        var stN = log(state, nameOf(state, pid) + ' steals a random card from ' + nameOf(state, nxt) + '.', stolen.id);
+        milestone(state, 'steal', { n: stN, pid: pid, target: nxt, cardId: 'gc29' });
+        pushBanner(state, { kind: 'card', cardId: 'gc29', card: cardView(stolen), private: true,
+          title: 'GC29 — CARD STOLEN',
+          text: nameOf(state, pid) + ' stole ' + label(stolen.id) + ' from ' + nameOf(state, nxt) + '.',
+          actor: pid, pendingPids: state.cfg.practiceBot ? [0] : (nxt !== pid ? [nxt, pid] : [pid]) });
         transferCard(state, nxt, pid, stolen);
-        log(state, nameOf(state, pid) + ' steals a random card from ' + nameOf(state, nxt) + '.', stolen.id);
         break;
       }
       case 'gc30': promptPlayers(state, { title: 'GC30 — force another player to roll', text: 'They get an extra roll on their next turn.', cardId: id, data: { op: 'gc30_target' } }); break;
@@ -899,8 +1296,22 @@
 
       /* ---------------- VERTIGO ---------------- */
       case 'vc1': promptPlayers(state, { title: 'VC1 — give a card away', text: 'Choose who gets one of your cards.', cardId: id, data: { op: 'vc1_target' } }); break;
-      case 'vc2': rotateTiles(state, -state.direction); log(state, 'All players swap tiles opposite turn order.'); break;
-      case 'vc3': rotateTiles(state, state.direction); log(state, 'All players swap tiles in turn order.'); break;
+      case 'vc2':
+        rotateTiles(state, -state.direction);
+        var v2n = log(state, 'All players swap tiles opposite turn order.', id);
+        milestone(state, 'swap', { n: v2n, pid: pid, cardId: id });
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC2 — ALL TILES ROTATED', text: 'All players swapped tiles opposite turn order!',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
+      case 'vc3':
+        rotateTiles(state, state.direction);
+        var v3n = log(state, 'All players swap tiles in turn order.', id);
+        milestone(state, 'swap', { n: v3n, pid: pid, cardId: id });
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC3 — ALL TILES ROTATED', text: 'All players swapped tiles in turn order!',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'vc4': enqueueDraw(state, pid, 3); break;
       case 'vc5': enqueueDraw(state, pid, 2); break;
       case 'vc6': promptPlayers(state, { title: 'VC6 — look at someone’s cards', text: 'Look at another player’s cards at the cost of one of your Good cards.', cardId: id, data: { op: 'vc6_target' } }); break;
@@ -917,15 +1328,41 @@
           .sort(function (a, b) { return Math.abs(a.tile - p.tile) - Math.abs(b.tile - p.tile); })[0];
         if (!closest) { log(state, 'No one to swap with.'); break; }
         var t9 = p.tile; setRawTile(state, pid, closest.tile); setRawTile(state, closest.i, t9);
-        log(state, 'Swapped places with ' + nameOf(state, closest.i) + ' (closest).');
+        var v9n = log(state, 'Swapped places with ' + nameOf(state, closest.i) + ' (closest).', id);
+        milestone(state, 'swap', { n: v9n, pid: pid, target: closest.i, cardId: id });
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC9 — TILES SWAPPED',
+          text: nameOf(state, pid) + ' swapped places with ' + nameOf(state, closest.i) + ' (closest pawn — now on tile ' + t9 + ').',
+          actor: pid, pendingPids: [state.cfg.practiceBot && closest.i > 0 ? 0 : closest.i] });
         break;
       }
       case 'vc10': p.status.alphabeticalUntilRound = state.round + 4; log(state, 'Alphabetical rolling for the next four rounds: 1→5, 2→4, 3→1, 4→6, 5→3, 6→2.'); break;
-      case 'vc11': everyoneTo(state, 50); break;
+      case 'vc11':
+        everyoneTo(state, 50);
+        milestone(state, 'warp', { n: effLogN, pid: pid, tile: 50, cardId: id });
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC11 — EVERYONE TO TILE 50',
+          text: 'Everyone moved to tile 50! Each player will draw a card for landing on 50.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'vc12': state.flags.nextDrawGiveTo = pid; log(state, 'The next person to draw has to give their card to you.'); break;
-      case 'vc13': state.flags.noMoveUntilTurnOf = pid; log(state, 'No one moves until it is your turn again.'); break;
+      case 'vc13':
+        state.flags.noMoveUntilTurnOf = pid;
+        log(state, 'No one moves until it is your turn again.');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC13 — MOVEMENT FROZEN',
+          text: 'No one moves until it is ' + nameOf(state, pid) + '’s turn again.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'vc14': p.status.nextCardGiveToNext = true; log(state, 'Your next card goes to the next player, and you draw another.'); break;
-      case 'vc15': state.players.forEach(function (q) { discardHand(state, q.i); }); log(state, 'Everyone’s cards are discarded.'); break;
+      case 'vc15':
+        state.players.forEach(function (q) { discardHand(state, q.i); });
+        log(state, 'Everyone’s cards are discarded.');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC15 — ALL HANDS DISCARDED',
+          text: 'Everyone discards all cards in their hand.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'vc16': {
         var cnt = p.hand.length;
         if (cnt <= 1) { log(state, 'This is your only card (or none) — VC16 is discarded.'); break; }
@@ -935,11 +1372,37 @@
         break;
       }
       case 'vc17': log(state, 'Nothing happens.'); break;
-      case 'vc18': state.direction *= -1; log(state, 'Play order direction is now ' + (state.direction === 1 ? 'clockwise' : 'counter-clockwise') + '.'); break;
-      case 'vc19': rotateHands(state, state.direction); log(state, 'Everyone swaps hands in the play order’s direction.'); break;
+      case 'vc18':
+        state.direction *= -1;
+        var v18n = log(state, 'Play order direction is now ' + (state.direction === 1 ? 'clockwise' : 'counter-clockwise') + '.', id);
+        milestone(state, 'direction', { n: v18n, pid: pid });
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC18 — ORDER REVERSED',
+          text: 'Play order direction is now ' + (state.direction === 1 ? 'clockwise' : 'counter-clockwise') + '.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
+      case 'vc19':
+        rotateHands(state, state.direction);
+        log(state, 'Everyone swaps hands in the play order’s direction.');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC19 — ALL HANDS ROTATED',
+          text: 'Everyone swapped hands in play order! Check your hand to see your new cards.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
+        break;
       case 'vc20':
-        if (instantBlocked(state)) log(state, 'VC25 blocks the instant result.');
-        else { state.gameover = true; state.winner = null; state.endReason = 'VC20 — the game ends. No one wins.'; state.phase = 'gameover'; state.queue.length = 0; }
+        if (instantBlocked(state)) {
+          var v20b = log(state, 'VC25 blocks the instant result.', 'vc25');
+          milestone(state, 'vc25_block', { n: v20b, pid: pid, cardId: 'vc20' });
+          pushBanner(state, { kind: 'effect', cardId: 'vc25',
+            title: 'VC25 — BLOCKED',
+            text: 'VC20 tried to end the game, but VC25 blocked the instant result!',
+            pendingPids: globalBannerPids(state, pid) });
+        } else {
+          state.gameover = true; state.winner = null; state.endReason = 'VC20 — the game ends. No one wins.';
+          state.phase = 'gameover'; state.queue.length = 0; state.prompt = null; state.reveal = null;
+          var v20n = log(state, 'Game over — VC20: the game ends. No one wins.', 'vc20');
+          milestone(state, 'no_win', { n: v20n, pid: pid, cardId: 'vc20' });
+        }
         break;
       case 'vc21': {
         var opts21 = cardOptions(state, pid);
@@ -963,6 +1426,10 @@
         shuffle(state.deck);
         state.players.forEach(function (q, i) { var k = i === pid ? Math.max(0, counts[i] - 1) : counts[i]; if (k) enqueueDraw(state, q.i, k); });
         log(state, 'All cards go back, the deck is reshuffled, and everyone redraws their hand (you draw one less).');
+        pushBanner(state, { kind: 'effect', cardId: id, card: cardView(card),
+          title: 'VC30 — EVERYONE REDRAWS',
+          text: 'All hands were reshuffled into the deck. Each player will redraw their cards.',
+          actor: pid, pendingPids: globalBannerPids(state, pid) });
         break;
       }
       case 'vc31': promptPlayers(state, { title: 'VC31 — someone else draws', text: 'Choose another player to draw a card.', cardId: id, data: { op: 'vc31_target' } }); break;
@@ -975,6 +1442,17 @@
       case '__gc20': forward(state, pid, 5); log(state, 'GC20: the Bad card still worked, but you also move five tiles ahead.'); break;
       default: log(state, 'No automated effect for ' + label(id) + ' — the table resolves it.');
     }
+
+    // Do not rush onto the next queued card until whoever is responsible acknowledges this card.
+    if (!state.gameover && !state.prompt && !state.reveal && (state.banners || []).length === bannersBefore &&
+        state.queue.length > 0 && id !== 'vc4' && id !== 'vc5' && id !== 'vc8' && id !== 'vc16') {
+      pushBanner(state, {
+        kind: 'effect', cardId: id, card: cardView(card),
+        title: label(id) + ' RESOLVED',
+        text: CARDS[id] ? CARDS[id].text : 'Effect resolved.',
+        actor: pid, pendingPids: [state.cfg.practiceBot && pid > 0 ? 0 : pid]
+      });
+    }
   }
 
   /* ---------- turns ---------- */
@@ -982,12 +1460,12 @@
     var p = cur(state);
     state.rolledThisTurn = false; p.drewThisTurn = false; state.canEndTurn = false;
     state.turnStartTile = p.tile;
-    state.lastElimination = null;
-    log(state, '— Round ' + state.round + ' · ' + nameOf(state, p.i) + '’s turn (tile ' + p.tile + ') —');
+    var tn = log(state, '— Round ' + state.round + ' · ' + nameOf(state, p.i) + '’s turn (tile ' + p.tile + ') —');
+    state.lastTurnLogN = tn;
   }
   function doRoll(state, action) {
     var p = cur(state);
-    if (state.rolledThisTurn || state.prompt || state.reveal) return;
+    if (state.rolledThisTurn || state.prompt || state.reveal || (state.banners && state.banners.length)) return;
     var raw = action && action.value != null && action.value !== '' ? clamp(Number(action.value) || 1, 1, 6) : d6();
     var die = raw;
     if (p.status.alphabeticalUntilRound >= state.round) die = ALPHA_MAP[raw] || raw;
@@ -995,13 +1473,21 @@
     if (hasCard(state, p.i, 'bc14')) die = Math.max(0, die - 1);
     state.lastDieRaw = raw; state.lastDie = die;
     p.lastRoll = die;
-    log(state, nameOf(state, p.i) + ' rolled ' + raw + (die !== raw ? ' → ' + die : '') + '.');
+    var rn = log(state, nameOf(state, p.i) + ' rolled ' + raw + (die !== raw ? ' → ' + die : '') + '.');
+    milestone(state, 'roll', { n: rn, pid: p.i, raw: raw, die: die, turnLogN: state.lastTurnLogN });
     state.rolledThisTurn = true;
     state.canEndTurn = false;
 
     if (p.status.needSix) {
       p.status.needSix = false;
-      if (raw !== 6) { log(state, 'BC4: the roll was not a 6.'); toNemo(state, p.i); return; }
+      if (raw !== 6) {
+        log(state, 'BC4: the roll was not a 6.');
+        toNemo(state, p.i, 'bc4');
+        pushBanner(state, { kind: 'effect', cardId: 'bc4', title: 'BC4 — TO POINT NEMO',
+          text: nameOf(state, p.i) + ' did not roll a 6 and went to Point Nemo (tile −1).',
+          actor: p.i, pendingPids: [state.cfg.practiceBot && p.i > 0 ? 0 : p.i] });
+        return;
+      }
       log(state, 'BC4: the roll was a 6. Safe.');
     }
     // Point Nemo includes tile 0: at the start of a turn there, the drag takes
@@ -1017,25 +1503,41 @@
     }
     if (p.tile < 0) {
       var t = p.tile + die;
-      if (t === 0) { setTile(state, p.i, 1, { landing: true }); log(state, 'Exact roll onto zero — escaped onto tile 1.'); }
+      if (t === 0) {
+        var eo = log(state, 'Exact roll onto zero — escaped onto tile 1.');
+        milestone(state, 'nemo_out', { n: eo, pid: p.i });
+        setTile(state, p.i, 1, { landing: true });
+      }
       else if (t > 0) { setRawTile(state, p.i, 0); log(state, 'Overshot zero — you land on 0 and need a 1 to escape.'); }
       else setRawTile(state, p.i, t);
       return;
     }
     var target = p.tile + die;
     if (target > 100) {
-      if (hasCard(state, p.i, 'gc33')) { log(state, 'GC33: no exact roll needed.'); setTile(state, p.i, 100, { landing: true }); }
-      else log(state, 'Exact roll needed for tile 100 — ' + nameOf(state, p.i) + ' stays on ' + p.tile + '.');
+      if (hasCard(state, p.i, 'gc33')) {
+        var g33n = log(state, 'GC33: no exact roll needed.', 'gc33');
+        milestone(state, 'gc33', { n: g33n, pid: p.i });
+        setTile(state, p.i, 100, { landing: true });
+      }
+      else {
+        var emn = log(state, 'Exact roll needed for tile 100 — ' + nameOf(state, p.i) + ' stays on ' + p.tile + '.');
+        milestone(state, 'exact_miss', { n: emn, pid: p.i, tile: p.tile });
+      }
     } else setTile(state, p.i, target, { landing: true });
   }
   function endTurn(state) {
-    if (state.gameover || state.prompt || state.reveal || state.queue.length) return;
+    if (state.gameover || state.prompt || state.reveal || (state.banners && state.banners.length) || state.queue.length) return;
     var leaving = state.turnIndex;
     state.watchers.filter(function (w) { return w.target === leaving; }).forEach(function (w) {
       var did = P(state, w.target).drewThisTurn;
       if (did !== w.requireDraw) {
-        log(state, 'BC' + (w.requireDraw ? '36' : '35') + ': the watched player ' + (did ? 'drew' : 'did not draw') + ' a card.');
-        toNemo(state, w.owner);
+        var cid = 'bc' + (w.requireDraw ? '36' : '35');
+        log(state, label(cid) + ': the watched player ' + (did ? 'drew' : 'did not draw') + ' a card.');
+        toNemo(state, w.owner, cid);
+        pushBanner(state, { kind: 'effect', cardId: cid,
+          title: label(cid) + ' — TO POINT NEMO',
+          text: nameOf(state, w.target) + ' ' + (did ? 'drew' : 'did not draw') + ' a card, sending ' + nameOf(state, w.owner) + ' to Point Nemo.',
+          actor: w.owner, pendingPids: [state.cfg.practiceBot && w.owner > 0 ? 0 : w.owner] });
       }
     });
     state.watchers = state.watchers.filter(function (w) { return w.target !== leaving; });
@@ -1095,19 +1597,30 @@
     return state;
   }
   function playCard(state, action) {
-    var pid = state.turnIndex, p = P(state, pid);
+    var pid = state.turnIndex;
     var card = findHandCard(state, pid, action.uid);
-    if (!card || card.sticky || state.prompt || state.reveal) return;
+    if (!card || card.sticky || state.prompt || state.reveal || (state.banners && state.banners.length)) return;
     if (state.flags.snatchNextGood != null && state.flags.snatchNextGood !== pid && typeOf(card.id) === 'Good') {
       var thief = state.flags.snatchNextGood; delete state.flags.snatchNextGood;
-      pluckCard(state, pid, card.uid); transferCard(state, pid, thief, card);
-      log(state, 'VC22: ' + nameOf(state, thief) + ' snatches ' + label(card.id) + ' the moment it is played.', card.id);
+      pluckCard(state, pid, card.uid);
+      var v22n = log(state, 'VC22: ' + nameOf(state, thief) + ' snatches ' + label(card.id) + ' the moment it is played.', card.id);
+      milestone(state, 'steal', { n: v22n, pid: thief, target: pid, cardId: 'vc22' });
+      pushBanner(state, { kind: 'card', cardId: 'vc22', card: cardView(card), private: true,
+        title: 'VC22 — CARD SNATCHED',
+        text: nameOf(state, thief) + ' snatched ' + label(card.id) + ' from ' + nameOf(state, pid) + ' the moment it was played.',
+        actor: thief, pendingPids: state.cfg.practiceBot ? [0] : [pid, thief] });
+      transferCard(state, pid, thief, card);
       return;
     }
     if (state.flags.negateNextCard != null) {
       var by = state.flags.negateNextCard; delete state.flags.negateNextCard;
       pluckCard(state, pid, card.uid); discardCard(state, card);
-      log(state, label(card.id) + ' was negated by VC32 (held by ' + nameOf(state, by) + ').', card.id);
+      var v32n = log(state, label(card.id) + ' was negated by VC32 (held by ' + nameOf(state, by) + ').', card.id);
+      milestone(state, 'vc32_negate', { n: v32n, pid: by, cardId: card.id });
+      pushBanner(state, { kind: 'effect', cardId: 'vc32', card: cardView(card),
+        title: 'VC32 — CARD NEGATED',
+        text: label(card.id) + ' played by ' + nameOf(state, pid) + ' was negated by VC32 (held by ' + nameOf(state, by) + ').',
+        actor: by, pendingPids: state.cfg.practiceBot ? [0] : (by !== pid ? [pid, by] : [pid]) });
       return;
     }
     pluckCard(state, pid, card.uid);
@@ -1118,6 +1631,8 @@
 
   function apply(state, action) {
     if (!action || !action.type) return state;
+    if (!state.banners) state.banners = [];
+    if (!state.milestones) state.milestones = [];
     var t = action.type;
     if (t === 'UNDO') return undo(state);
     if (t === 'SET_NAME' && state.phase === 'lobby' && state.players[action.pid]) {
@@ -1140,12 +1655,53 @@
       state.version++;
       return state;
     }
-    if (t === 'ACK_ELIM') {
-      state.lastElimination = null;
+    if (t === 'ACK_BANNER') {
+      if (!state.banners.length) { state.lastElimination = null; state.version++; return state; }
+      var b = state.banners[0];
+      if (action.seat != null) {
+        var pos = b.pendingPids.indexOf(action.seat);
+        if (pos < 0) return state;
+        b.pendingPids.splice(pos, 1);
+      } else {
+        b.pendingPids.shift();
+      }
+      if (!b.pendingPids.length) {
+        state.banners.shift();
+        if (b.kind === 'out' && !state.banners.some(function (x) { return x.kind === 'out'; })) {
+          state.lastElimination = null;
+        }
+      }
       state.version++;
+      settle(state);
+      return state;
+    }
+    if (t === 'ACK_ELIM') {
+      if (state.banners.length && state.banners[0].kind === 'out') {
+        var ob = state.banners[0];
+        if (action.seat != null && ob.pendingPids.indexOf(action.seat) >= 0) {
+          ob.pendingPids.splice(ob.pendingPids.indexOf(action.seat), 1);
+        } else {
+          ob.pendingPids.length = 0;
+        }
+        if (!ob.pendingPids.length) state.banners.shift();
+      }
+      if (!state.banners.some(function (x) { return x.kind === 'out'; })) state.lastElimination = null;
+      state.version++;
+      settle(state);
+      return state;
+    }
+    if (t === 'DM_SKIP_BANNER') {
+      if (action.seat != null && action.seat !== 0) return state;
+      if (state.banners.length) {
+        var sb = state.banners.shift();
+        if (sb.kind === 'out' && !state.banners.some(function (x) { return x.kind === 'out'; })) state.lastElimination = null;
+      }
+      state.version++;
+      settle(state);
       return state;
     }
     if (state.phase !== 'turn' || state.gameover) return state;
+    if (state.banners.length && t.indexOf('DM_') !== 0) return state;
     if (action.seat != null && (t === 'ROLL' || t === 'PLAY_CARD' || t === 'END_TURN') && action.seat !== state.turnIndex) return state;
     if (action.seat != null && t === 'ANSWER' && action.seat !== (state.prompt ? state.prompt.forPid : state.turnIndex)) return state;
     if (action.seat != null && t === 'ACK' && action.seat !== (state.reveal ? state.reveal.pid : state.turnIndex)) return state;
@@ -1167,12 +1723,385 @@
       case 'DM_RESHUFFLE': reshuffle(state); break;
       case 'DM_CLEAR_RULES': clearRules(state); break;
       case 'DM_REVERSE': state.direction *= -1; log(state, 'Table reverses play order direction.'); break;
-      case 'DM_END_TURN': state.queue.length = 0; state.prompt = null; state.reveal = null; state.rolledThisTurn = true; endTurn(state); break;
+      case 'DM_END_TURN': state.queue.length = 0; state.prompt = null; state.reveal = null; state.banners.length = 0; state.lastElimination = null; state.rolledThisTurn = true; endTurn(state); break;
       default: break;
     }
     state.version++;
     settle(state);
     return state;
+  }
+
+  /* ---------- win chronicle / premade phrases ---------- */
+  var WIN_PHRASES = {
+    openers: [
+      'All pawns set out together from tile 1 [{start}].',
+      'With 108 cards shuffled into the deck, everyone began on tile 1 [{start}].',
+      'Pawns lined up shoulder-to-shoulder at the base of the board [{start}].',
+      'Across {rounds} chaotic rounds that started on tile 1 [{start}], the match took shape.',
+      'From the opening deal on tile 1 [{start}], every roll carried risk.',
+      'Once every pawn took its place on tile 1 [{start}], the race began.'
+    ],
+    turnContext: [
+      'By Round {round}, the decisive stretch was underway [{turn}].',
+      'Heading into Round {round}, the balance of the match shifted [{turn}].',
+      'In Round {round}, the final push began [{turn}].',
+      'Round {round} set up the closing stretch [{turn}].'
+    ],
+    ladders: [
+      '{name} caught a massive break up the {from} → {to} ladder [{n}]',
+      '{name} climbed the ladder from tile {from} straight up to {to} [{n}]',
+      '{name} skipped ahead of the pack by climbing {from} → {to} [{n}]',
+      '{name} hit the hidden ladder at {from} and rocketed onto {to} [{n}]'
+    ],
+    snakes: [
+      '{name} had to claw back after sliding down the snake at {from} → {to} [{n}]',
+      '{name} took a brutal drop on the {from} → {to} snake yet stayed in it [{n}]',
+      '{name} survived a nasty snake bite from tile {from} down to {to} [{n}]',
+      '{name} shook off a sharp slide from tile {from} down to {to} [{n}]'
+    ],
+    snakeMiracles: {
+      snake_immune: [
+        '{name} walked straight past the snake at {from} with snake immunity [{n}]',
+        '{name} stayed untouched on tile {from} thanks to GC8 [{n}]'
+      ],
+      snake_second_chance: [
+        '{name} turned the snake at {from} into a step ahead to tile {to} via GC21 [{n}]',
+        'GC21 rescued {name} right at snake {from}, bumping them onto {to} [{n}]'
+      ],
+      snake_mirror: [
+        '{name} flipped the snake at {from} into a ladder up to {to} with GC15 [{n}]',
+        'GC15 mirrored the snake at {from} upward onto tile {to} for {name} [{n}]'
+      ]
+    },
+    nemoIn: [
+      '{name} was banished below zero into Point Nemo [{n}]',
+      '{name} survived exile down in Point Nemo [{n}]',
+      '{name} endured a drop below zero into Point Nemo [{n}]'
+    ],
+    nemoOut: [
+      '{name} rolled an exact escape through zero back to tile 1 [{n}]',
+      '{name} broke out of Point Nemo on an exact roll back into contention [{n}]'
+    ],
+    seq1: [
+      '{name} opened the 3 → 7 → 13 run by landing on tile 3 [{n}]',
+      '{name} claimed tile 3 as the first step of the sequence [{n}]',
+      '{name} started the secret sequence by touching down on tile 3 [{n}]'
+    ],
+    seq2: [
+      '{name} returned on a separate turn to lock in tile 7 [{n}]',
+      '{name} reached 2/3 of the sequence by landing on tile 7 [{n}]',
+      '{name} stepped onto tile 7 to move one rung from a sequence win [{n}]'
+    ],
+    seq3: [
+      '{name} landed on tile 13 before the snake could bite to finish 3 → 7 → 13 [{n}]',
+      '{name} stepped onto tile 13 on a fresh turn to seal the sequence [{n}]'
+    ],
+    dramatic: {
+      swap: [
+        '{name} pulled off a pivotal tile swap via {card} [{n}]',
+        'a timely {card} tile swap reshaped positions on the board [{n}]'
+      ],
+      steal: [
+        '{name} snatched a card away from {target} with {card} [{n}]',
+        '{card} forced a sudden hand shake-up involving {name} [{n}]'
+      ],
+      warp1: [
+        'BC25 dragged the entire table all the way back to tile 1 [{n}]',
+        'everyone was reset back to the starting tile by BC25 [{n}]'
+      ],
+      warp50: [
+        'VC11 warped every surviving pawn straight onto tile 50 [{n}]',
+        'every pawn jumped together to tile 50 after VC11 fired [{n}]'
+      ],
+      gc13_save: [
+        '{name} defied elimination when GC13 blocked a loss on the spot [{n}]',
+        'GC13 kept {name} alive when defeat looked certain [{n}]'
+      ],
+      gc11_block: [
+        '{name} used GC11 to intercept {target}’s instant win and send them to tile 1 [{n}]',
+        'GC11 stopped an instant victory cold and reset {target} to the start [{n}]'
+      ],
+      vc25_block: [
+        'VC25 stepped in to block an instant game-ender [{n}]',
+        'an instant result card was shut down by VC25 before it could resolve [{n}]'
+      ],
+      vc32_negate: [
+        '{name} used VC32 to negate a card on impact [{n}]',
+        'VC32 canceled a card before its effect could land [{n}]'
+      ],
+      curse_hit: [
+        'a hidden curse on tile {tile} sprang onto {name} [{n}]',
+        'stepping onto a cursed tile triggered a hidden trap on {name} [{n}]'
+      ],
+      clear: [
+        'GC22 wiped every ongoing card rule clean off the table [{n}]'
+      ],
+      direction: [
+        'VC18 flipped the turn order into reverse [{n}]'
+      ],
+      exact_miss: [
+        '{name} was turned back from tile 100 by the exact-roll rule [{n}]',
+        'an overshoot stalled {name} shy of tile 100 [{n}]'
+      ],
+      gc33: [
+        'GC33 let {name} ignore the exact-roll rule at tile 100 [{n}]'
+      ]
+    },
+    elims: {
+      nemo9: [
+        '{name} sank all the way to tile −9 and was eliminated [{n}]',
+        '{name} hit the −9 floor of Point Nemo and dropped out [{n}]'
+      ],
+      bc30: [
+        '{name} drew BC30 and lost on the spot [{n}]',
+        'the instant-loss card BC30 knocked {name} out immediately [{n}]'
+      ],
+      bc22: [
+        '{name} had no Good cards to satisfy BC22 and was knocked out [{n}]'
+      ],
+      bc7: [
+        '{name} drew matching card types back-to-back while holding BC7 and lost [{n}]'
+      ],
+      bc11: [
+        '{name} went down in a mutual BC11 elimination [{n}]'
+      ],
+      prediction: [
+        '{name} missed a card-type prediction and was eliminated [{n}]'
+      ],
+      tableCall: [
+        '{name} failed a table call and exited the match [{n}]'
+      ],
+      dm: [
+        '{name} was removed from the match by the table [{n}]'
+      ],
+      other: [
+        '{name} was knocked out ({reason}) [{n}]'
+      ]
+    },
+    closers: {
+      tile100: [
+        'With a roll of {roll} [{rollN}], {winner} landed squarely on tile 100 to take the win [{winN}].',
+        'Stepping onto tile 100 after rolling {roll} [{rollN}] sealed victory for {winner} [{winN}].',
+        'With a roll of {roll} [{rollN}], {winner} reached tile 100 ahead of the field to clinch the match [{winN}].'
+      ],
+      tile100NoRoll: [
+        'Finally, {winner} arrived on tile 100 to claim victory [{winN}].',
+        'Landing squarely on tile 100 put {winner} over the top for the win [{winN}].'
+      ],
+      sequence: [
+        'Completing 3 [{s1}], 7 [{s2}], and 13 [{s3}] on separate turns bypassed tile 100 and handed {winner} the sequence win [{winN}].',
+        'By landing on 3 [{s1}], then 7 [{s2}], then 13 [{s3}] in turn order, {winner} triggered the secret sequence victory [{winN}].'
+      ],
+      lastStanding: [
+        'With every other rival out of the running, {winner} stood alone as the last player standing [{winN}].',
+        'Outlasting the entire table as opponents fell one by one crowned {winner} the winner [{winN}].'
+      ],
+      gc10: [
+        'Playing GC10 ended the race on the spot and gave {winner} an instant victory [{winN}].',
+        'No climb to 100 was needed — GC10 won the game immediately for {winner} [{winN}].'
+      ],
+      vc34_35: [
+        'Holding both VC34 and VC35 variants together triggered an instant combo win for {winner} [{winN}].',
+        'Uniting VC34 and VC35 in hand unlocked the variant instant win for {winner} [{winN}].'
+      ],
+      snake100: [
+        'Turning a snake straight onto tile 100 gave {winner} a dramatic finish [{winN}].',
+        'Riding a modified snake directly onto tile 100 sealed the match for {winner} [{winN}].'
+      ],
+      vc20: [
+        'Then VC20 hit the table and ended the entire match on the spot — nobody wins [{winN}].',
+        'In true VUSAL fashion, VC20 pulled the plug on the game immediately with zero winners [{winN}].'
+      ],
+      fallback: [
+        'That decisive moment brought the game to an end, making {winner} the winner [{winN}].'
+      ]
+    }
+  };
+
+  function pickPhrase(arr, seed) {
+    if (!arr || !arr.length) return '';
+    return arr[Math.abs(seed || 0) % arr.length];
+  }
+  function fmtPhrase(tpl, vars) {
+    return String(tpl || '').replace(/\{(\w+)\}/g, function (_, k) {
+      return vars[k] != null ? String(vars[k]) : '';
+    });
+  }
+  function extractCites(text) {
+    var out = [], seen = {};
+    String(text || '').replace(/\[(\d+)\]/g, function (_, num) {
+      var n = Number(num);
+      if (!seen[n]) { seen[n] = true; out.push(n); }
+      return _;
+    });
+    return out;
+  }
+  function buildWinStory(state) {
+    if (!state || !state.gameover) return null;
+    var logs = state.log || [];
+    var logMap = {};
+    logs.forEach(function (l) { logMap[l.n] = l; });
+    var ms = state.milestones || [];
+    var w = state.winner == null ? null : P(state, state.winner);
+    var winnerName = w ? nameOf(state, w.i) : 'No one';
+    var seed = (state.turnCount || 0) * 7 + (state.nextLogN || logs.length) + (w ? w.i * 13 : 5);
+    var parts = [];
+    var usedN = {};
+    var isSeqWin = !!(w && (w.seq === 3 || /3 → 7 → 13/.test(String(state.endReason || ''))));
+
+    function addPart(text) {
+      if (!text) return;
+      var cites = extractCites(text);
+      cites.forEach(function (n) { usedN[n] = true; });
+      parts.push({ text: text, cites: cites });
+    }
+
+    var startM = ms.find(function (m) { return m.type === 'start'; }) || logs[0];
+    var startN = startM ? startM.n : 1;
+    addPart(fmtPhrase(pickPhrase(WIN_PHRASES.openers, seed), {
+      start: startN, rounds: state.round || 1
+    }));
+
+    // Collect key turning-point milestones (prioritize winner + eliminations + major twists)
+    var middle = [];
+    var seqSteps = {};
+    var lastWinRoll = null;
+    var winM = null;
+
+    ms.forEach(function (m) {
+      if (m.type === 'win' || m.type === 'no_win') { winM = m; return; }
+      if (m.type === 'roll' && w && m.pid === w.i) { lastWinRoll = m; return; }
+      if (m.type === 'seq' && w && m.pid === w.i) { seqSteps[m.step] = m; }
+      if (m.type === 'start') return;
+      if (isSeqWin && m.type === 'seq' && w && m.pid === w.i && m.step === 3) return;
+      var score = 1;
+      if (m.type === 'elim' || m.type === 'seq' || m.type === 'gc11_block' || m.type === 'gc13_save' || m.type === 'vc25_block') score += 5;
+      else if (m.type === 'ladder' || m.type === 'snake_mirror' || m.type === 'snake_second_chance' || m.type === 'warp' || m.type === 'nemo_out') score += 4;
+      else if (m.type === 'snake' || m.type === 'nemo_in' || m.type === 'swap' || m.type === 'steal' || m.type === 'curse_hit') score += 3;
+      if (w && m.pid === w.i) score += 2;
+      middle.push({ m: m, score: score });
+    });
+
+    // Select top up to 5 distinct turning-point beats, then order chronologically by log #
+    middle.sort(function (a, b) { return b.score - a.score || a.m.n - b.m.n; });
+    var picked = [];
+    var pickedTypes = {};
+    for (var i = 0; i < middle.length && picked.length < 5; i++) {
+      var item = middle[i], m = item.m;
+      if (usedN[m.n]) continue;
+      // Avoid picking two duplicate generic snakes/ladders unless different players or rare
+      var key = m.type + ':' + (m.pid != null ? m.pid : '');
+      if (m.type !== 'elim' && m.type !== 'seq' && pickedTypes[key]) continue;
+      pickedTypes[key] = true;
+      picked.push(m);
+    }
+    picked.sort(function (a, b) { return a.n - b.n; });
+
+    // Optional round context if picked list is short
+    if (picked.length < 2 && lastWinRoll && lastWinRoll.turnLogN && lastWinRoll.turnLogN !== startN) {
+      addPart(fmtPhrase(pickPhrase(WIN_PHRASES.turnContext, seed + 1), {
+        round: lastWinRoll.round || state.round, turn: lastWinRoll.turnLogN
+      }));
+    }
+
+    picked.forEach(function (m, idx) {
+      var nm = m.pid != null ? nameOf(state, m.pid) : 'A player';
+      var tg = m.target != null ? nameOf(state, m.target) : 'another player';
+      var s = seed + idx * 3 + m.n;
+      var line = '';
+      switch (m.type) {
+        case 'ladder':
+          line = fmtPhrase(pickPhrase(WIN_PHRASES.ladders, s), { name: nm, from: m.from, to: m.to, n: m.n });
+          break;
+        case 'snake':
+          line = fmtPhrase(pickPhrase(WIN_PHRASES.snakes, s), { name: nm, from: m.from, to: m.to < 0 ? '−' + Math.abs(m.to) : m.to, n: m.n });
+          break;
+        case 'snake_immune': case 'snake_second_chance': case 'snake_mirror':
+          line = fmtPhrase(pickPhrase(WIN_PHRASES.snakeMiracles[m.type], s), { name: nm, from: m.from, to: m.to, n: m.n });
+          break;
+        case 'nemo_in':
+          line = fmtPhrase(pickPhrase(WIN_PHRASES.nemoIn, s), { name: nm, n: m.n });
+          break;
+        case 'nemo_out':
+          line = fmtPhrase(pickPhrase(WIN_PHRASES.nemoOut, s), { name: nm, n: m.n });
+          break;
+        case 'seq':
+          if (m.step === 1) line = fmtPhrase(pickPhrase(WIN_PHRASES.seq1, s), { name: nm, n: m.n });
+          else if (m.step === 2) line = fmtPhrase(pickPhrase(WIN_PHRASES.seq2, s), { name: nm, n: m.n });
+          else if (m.step === 3) line = fmtPhrase(pickPhrase(WIN_PHRASES.seq3, s), { name: nm, n: m.n });
+          break;
+        case 'warp':
+          line = fmtPhrase(pickPhrase(m.tile === 50 ? WIN_PHRASES.dramatic.warp50 : WIN_PHRASES.dramatic.warp1, s), { name: nm, n: m.n });
+          break;
+        case 'swap': case 'steal': case 'gc13_save': case 'gc11_block': case 'vc25_block':
+        case 'vc32_negate': case 'curse_hit': case 'clear': case 'direction': case 'exact_miss': case 'gc33':
+          line = fmtPhrase(pickPhrase(WIN_PHRASES.dramatic[m.type], s), {
+            name: nm, target: tg, card: m.cardId ? label(m.cardId) : 'a card', tile: m.tile, n: m.n
+          });
+          break;
+        case 'elim': {
+          var r = String(m.reason || '');
+          var grp = WIN_PHRASES.elims.other;
+          if (/−9|-9/.test(r)) grp = WIN_PHRASES.elims.nemo9;
+          else if (/bc30/i.test(r)) grp = WIN_PHRASES.elims.bc30;
+          else if (/bc22/i.test(r)) grp = WIN_PHRASES.elims.bc22;
+          else if (/bc7/i.test(r)) grp = WIN_PHRASES.elims.bc7;
+          else if (/bc11/i.test(r)) grp = WIN_PHRASES.elims.bc11;
+          else if (/prediction/i.test(r)) grp = WIN_PHRASES.elims.prediction;
+          else if (/table call/i.test(r)) grp = WIN_PHRASES.elims.tableCall;
+          else if (/removed by the table/i.test(r)) grp = WIN_PHRASES.elims.dm;
+          line = fmtPhrase(pickPhrase(grp, s), { name: nm, reason: r, n: m.n });
+          break;
+        }
+      }
+      if (line) addPart(line.charAt(0).toUpperCase() + line.slice(1) + '.');
+    });
+
+    // Closer sentence tailored to exact win condition
+    var winN = winM ? winM.n : (logs.length ? logs[logs.length - 1].n : startN);
+    var reason = String(state.endReason || '');
+    var closer = '';
+    if (!w) {
+      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.vc20, seed), { winN: winN });
+    } else if (w.seq === 3 || /3 → 7 → 13/.test(reason)) {
+      var s1 = seqSteps[1] ? seqSteps[1].n : startN;
+      var s2 = seqSteps[2] ? seqSteps[2].n : winN;
+      var s3 = seqSteps[3] ? seqSteps[3].n : winN;
+      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.sequence, seed), {
+        winner: winnerName, s1: s1, s2: s2, s3: s3, winN: winN
+      });
+    } else if (/last player standing/i.test(reason)) {
+      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.lastStanding, seed), { winner: winnerName, winN: winN });
+    } else if (/gc10/i.test(reason)) {
+      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.gc10, seed), { winner: winnerName, winN: winN });
+    } else if (/vc34|vc35/i.test(reason)) {
+      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.vc34_35, seed), { winner: winnerName, winN: winN });
+    } else if (/gc15|gc21/i.test(reason)) {
+      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.snake100, seed), { winner: winnerName, winN: winN });
+    } else if (/tile 100/i.test(reason)) {
+      if (lastWinRoll && lastWinRoll.n && lastWinRoll.n < winN) {
+        closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.tile100, seed), {
+          winner: winnerName, roll: lastWinRoll.die != null ? lastWinRoll.die : lastWinRoll.raw, rollN: lastWinRoll.n, winN: winN
+        });
+      } else {
+        closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.tile100NoRoll, seed), { winner: winnerName, winN: winN });
+      }
+    } else {
+      closer = fmtPhrase(pickPhrase(WIN_PHRASES.closers.fallback, seed), { winner: winnerName, winN: winN });
+    }
+    addPart(closer);
+
+    var allCites = Object.keys(usedN).map(Number).sort(function (a, b) { return a - b; });
+    var citedLogs = allCites.map(function (n) {
+      return logMap[n] || { n: n, text: 'Log entry #' + n + ' (earlier in match)', cardId: null };
+    });
+
+    return {
+      headline: w ? (winnerName + ' WINS') : 'NO ONE WINS',
+      summary: parts.map(function (x) { return x.text; }).join(' '),
+      parts: parts,
+      citedLogs: citedLogs
+    };
   }
 
   /* ---------- view ---------- */
@@ -1228,27 +2157,67 @@
     s.you = s.players[seat] || null;
     s.canAck = !!(state.reveal && state.reveal.pid === seat);
     s.canAnswer = !!(state.prompt && state.prompt.forPid === seat);
+
     if (state.reveal) {
-      if (state.reveal.public || state.reveal.pid === seat) {
-        s.reveal = state.reveal;
+      if (state.reveal.pid === seat) {
+        s.reveal = clone(state.reveal);
+      } else if (state.reveal.public) {
+        var pubRev = clone(state.reveal);
+        if (pubRev.cards && pubRev.cards.length) {
+          pubRev.cards = pubRev.cards.map(function (it) {
+            if (it.public) return it;
+            return { card: null, secret: true, text: 'Kept secret in hand', kept: true, public: false, jazz: false, statusNote: 'KEPT IN HAND (SECRET)' };
+          });
+          var firstPub = pubRev.cards.find(function (it) { return it.card; });
+          if (firstPub) { pubRev.card = firstPub.card; pubRev.text = firstPub.text; }
+        }
+        s.reveal = pubRev;
       } else {
         s.reveal = null;
-        s.waiting = { kind: 'reveal', pid: state.reveal.pid, name: nameOf(state, state.reveal.pid) };
+        s.waiting = { kind: 'reveal', pid: state.reveal.pid, name: nameOf(state, state.reveal.pid), count: (state.reveal.cards || [1]).length };
       }
     } else s.reveal = null;
+
+    var banners = state.banners || [];
+    s.bannersCount = banners.length;
+    if (!state.reveal && banners.length) {
+      var b = banners[0];
+      var isResp = b.pendingPids.indexOf(seat) >= 0;
+      var canSee = isResp || !b.private || (b.allPids && b.allPids.indexOf(seat) >= 0);
+      s.canAckBanner = isResp;
+      if (canSee) {
+        s.banner = clone(b);
+      } else {
+        s.banner = null;
+        s.waiting = {
+          kind: 'banner',
+          pid: b.pendingPids[0],
+          name: b.pendingPids.map(function (i) { return nameOf(state, i); }).join(', '),
+          title: 'is reviewing a received card.'
+        };
+      }
+    } else {
+      s.banner = null;
+      s.canAckBanner = false;
+    }
+
     if (state.prompt) {
       if (state.prompt.forPid === seat) s.prompt = state.prompt;
       else { s.prompt = null; s.waiting = { kind: 'prompt', pid: state.prompt.forPid, name: nameOf(state, state.prompt.forPid), title: state.prompt.title }; }
     } else s.prompt = null;
+
+    s.winStory = state.gameover ? buildWinStory(state) : null;
+
     delete s.deck; delete s.discard; delete s.history; delete s.queue; delete s.curses; delete s.flags; delete s.watchers;
-    delete s.nextUid; delete s.lastCard0;
+    delete s.nextUid; delete s.lastCard0; delete s.banners; delete s.milestones; delete s.nextLogN; delete s.lastTurnLogN;
     return s;
   }
 
   return {
     CARDS: CARDS, CARD_IDS: CARD_IDS, SNAKES: SNAKES, LADDERS: LADDERS, LADDER_TOPS: LADDER_TOPS,
-    BOARD_GRID: BOARD_GRID, ALPHA_MAP: ALPHA_MAP,
+    BOARD_GRID: BOARD_GRID, ALPHA_MAP: ALPHA_MAP, WIN_PHRASES: WIN_PHRASES,
     newGame: newGame, apply: apply, view: view, statusLines: statusLines,
+    buildWinStory: buildWinStory,
     tileCoords: tileCoords, tileAt: tileAt, verticalTile: verticalTile
   };
 });
